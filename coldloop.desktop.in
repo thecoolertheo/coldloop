@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Coldloop
+GenericName=Cooler Control
+Comment=Control pump, fans and the LCD on the NZXT Kraken Elite
+Exec=@COLDLOOP_DIR@/venv/bin/python @COLDLOOP_DIR@/kraken_controller.py
+Path=@COLDLOOP_DIR@
+Icon=coldloop
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=nzxt;kraken;liquidctl;cooler;fan;pump;lcd;coldloop;
+StartupNotify=true
+StartupWMClass=kraken_controller.py

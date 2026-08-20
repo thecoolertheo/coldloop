@@ -1,6 +1,6 @@
 [Unit]
 Description=Coldloop lighting for NZXT Kraken Elite (pump ring and fan chain)
-Documentation=file:///home/theo/liquidctl-env/VERIFIED_COMMANDS.md
+Documentation=file://@COLDLOOP_DIR@/VERIFIED_COMMANDS.md
 
 # Starts at boot rather than at login; see liquidctl.service for the two halves
 # that make that work (`loginctl enable-linger` plus WantedBy=default.target).
@@ -20,9 +20,10 @@ StartLimitBurst=5
 [Service]
 Type=simple
 
-# Same boot-versus-login race as the HUD: wait for the cooler to appear rather
-# than failing instantly and burning the restart budget before login.
-ExecStartPre=/bin/sh -c 'for i in $(seq 45); do /home/theo/liquidctl-env/venv/bin/liquidctl list 2>/dev/null | grep -q Kraken && exit 0; sleep 1; done; echo "Kraken did not appear on the USB bus within 45s" >&2; exit 1'
+# Same wait-and-verify as the HUD. Lighting sets no duties, so the refusal
+# matters less here, but writing Hue 2 reports to an unverified cooler is still
+# not worth doing for a cosmetic feature.
+ExecStartPre=@COLDLOOP_DIR@/venv/bin/python @COLDLOOP_DIR@/kraken_hud.py --wait-for-device 45
 TimeoutStartSec=120
 
 # Why this is a long-running service and not a one-shot command:
@@ -38,13 +39,13 @@ TimeoutStartSec=120
 # This deliberately does NOT run `liquidctl initialize` or touch pump and fan
 # duties. Cooling belongs to liquidctl.service alone; nothing about lighting
 # should be able to change how hard the fans run.
-ExecStart=/home/theo/liquidctl-env/venv/bin/python \
-    /home/theo/liquidctl-env/coldloop_lighting.py --apply
+ExecStart=@COLDLOOP_DIR@/venv/bin/python \
+    @COLDLOOP_DIR@/coldloop_lighting.py --apply
 
 # Leave the LEDs dark rather than holding a half-decayed colour once nothing is
 # refreshing them. `-` so a failure here cannot block the stop.
-ExecStopPost=-/home/theo/liquidctl-env/venv/bin/python \
-    /home/theo/liquidctl-env/coldloop_lighting.py --off
+ExecStopPost=-@COLDLOOP_DIR@/venv/bin/python \
+    @COLDLOOP_DIR@/coldloop_lighting.py --off
 
 Restart=on-failure
 RestartSec=10

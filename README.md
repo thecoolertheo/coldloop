@@ -3,13 +3,48 @@
 Linux control for the NZXT Kraken 2024 Elite RGB (CAM is Windows-only), built on
 [liquidctl](https://github.com/liquidctl/liquidctl).
 
+> **Supported hardware: one cooler.** Everything here was verified against an
+> **NZXT Kraken 2024 Elite RGB (USB `1e71:3012`)** on Bazzite. Coldloop refuses
+> to configure any other cooler rather than guess — its pump and fan curves are
+> applied at boot and were checked against this device alone. The RGB support
+> additionally relies on an unmerged, reverse-engineered protocol
+> ([liquidctl#882](https://github.com/liquidctl/liquidctl/pull/882)); there is
+> no official NZXT specification for it.
+
+## Install
+
+```
+git clone <repo-url> coldloop && cd coldloop
+./install.sh
+```
+
+That creates a virtualenv from the pinned `requirements.txt`, checks a
+supported cooler is actually present, installs two `systemd --user` units plus
+a desktop entry and icon, and starts everything. Nothing is written outside
+`$HOME` and nothing needs root.
+
+The one thing that may need root is device access. If the installer reports no
+supported cooler but you know it is plugged in, you are probably missing
+liquidctl's udev rule:
+
+```
+sudo curl -o /etc/udev/rules.d/71-liquidctl.rules \
+  https://raw.githubusercontent.com/liquidctl/liquidctl/main/extra/linux/71-liquidctl.rules
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+Remove everything with `./install.sh --uninstall`. Your palette, faces and
+lighting settings in `~/.config/coldloop/` are left alone.
+
 | File | Purpose |
 | --- | --- |
 | `kraken_hud.py` | Renders the telemetry HUD and pushes it to the 640x640 LCD in a loop |
 | `coldloop_lighting.py` | Pump-ring and fan-chain RGB (the only part that does not use the liquidctl CLI) |
 | `kraken_controller.py` | **Coldloop**, the PyQt6 control panel (hardware, gallery, editor, diagnostics) |
-| `liquidctl.service` | systemd `--user` unit for the HUD; installed copy lives at `~/.config/systemd/user/` |
-| `coldloop-lighting.service` | systemd `--user` unit that holds the LED colour (the firmware forgets it) |
+| `liquidctl.service.in` | systemd `--user` unit template for the HUD; `install.sh` fills in the path |
+| `coldloop-lighting.service.in` | unit template that holds the LED colour (the firmware forgets it) |
+| `install.sh` | Installs/uninstalls the venv, units, desktop entry and icon |
+| `compat/smbus.py` | Pure-python stand-in for the C extension liquidctl declares |
 | `VERIFIED_COMMANDS.md` | Ground-truth liquidctl syntax and duty limits for this device |
 
 The controller is in the GNOME app grid and dock as **Coldloop**
@@ -61,9 +96,9 @@ If the graphical session itself will not come up, Bazzite's GRUB emergency mode
 password; from there:
 
 ```
-rm /home/theo/.config/systemd/user/default.target.wants/liquidctl.service
-rm /home/theo/.config/systemd/user/default.target.wants/coldloop-lighting.service
-rm /var/lib/systemd/linger/theo      # stop the services starting at boot at all
+rm ~/.config/systemd/user/default.target.wants/liquidctl.service
+rm ~/.config/systemd/user/default.target.wants/coldloop-lighting.service
+rm /var/lib/systemd/linger/$USER      # stop the services starting at boot at all
 ```
 
 Note the path is `default.target.wants`, not `graphical-session.target.wants`:
@@ -77,7 +112,7 @@ Both services come up at boot, before anyone logs in, and keep running across
 logout. That needs two things, and neither works on its own:
 
 ```
-loginctl enable-linger theo     # start this user's systemd instance at boot
+loginctl enable-linger $USER     # start this user's systemd instance at boot
 ```
 
 plus `WantedBy=default.target` in both units. `graphical-session.target` — what
@@ -98,7 +133,7 @@ manual `systemctl --user reset-failed`.
 To go back to starting at login:
 
 ```
-loginctl disable-linger theo
+loginctl disable-linger $USER
 ```
 
 ## Switching faces

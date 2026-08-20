@@ -46,6 +46,17 @@ if not os.path.exists(LIQUIDCTL):
     LIQUIDCTL = "liquidctl"
 
 MATCH = "Kraken"
+
+# The only cooler this project has been verified against. `MATCH` above is a
+# description substring and happily selects any Kraken, which is fine for
+# reading status but not for what the service does next: it applies a pump and
+# fan curve at boot, before anyone can log in and stop it. Those duties were
+# checked against this device's driver table and no other, so `--wait-for-device`
+# refuses anything else rather than applying an unverified curve to it.
+SUPPORTED_VENDOR_ID = 0x1E71
+SUPPORTED_PRODUCT_ID = 0x3012
+SUPPORTED_NAME = "NZXT Kraken 2024 Elite RGB (1e71:3012)"
+
 SIZE = 640
 CENTER = SIZE / 2.0
 
@@ -2031,8 +2042,61 @@ def run_loop(interval: float, style: str = DEFAULT_STYLE) -> int:
     return 0
 
 
+def wait_for_supported_device(timeout: float) -> int:
+    """Block until the verified cooler is on the USB bus. Returns an exit code.
+
+    Two jobs in one, both needed by the service units before they touch a duty:
+
+    Waiting, because starting at boot races USB enumeration in a way starting
+    at login never did. Failing instantly there would burn the unit's whole
+    restart budget in under a minute and leave it permanently failed.
+
+    Refusing, because the pump and fan curves that run next were verified
+    against one device. `--match Kraken` would happily select a Z73 and apply
+    them to it, at boot, before anyone could intervene.
+    """
+    deadline = time.monotonic() + timeout
+    seen: set[str] = set()
+    while True:
+        proc = _run([LIQUIDCTL, "--match", MATCH, "list", "--verbose"], timeout=15.0)
+        if proc is not None and proc.returncode == 0:
+            text = proc.stdout
+            if f"{SUPPORTED_PRODUCT_ID:#06x}" in text and f"{SUPPORTED_VENDOR_ID:#06x}" in text:
+                return 0
+            # Something answering to "Kraken" is present but is not the device
+            # these duties were checked against. Waiting will not change that,
+            # so fail now with a message that names what was found.
+            for line in text.splitlines():
+                if "Product ID" in line or line.startswith("Result"):
+                    seen.add(line.strip())
+            if seen:
+                print(
+                    f"[hud] refusing to configure an unverified cooler.\n"
+                    f"      supported: {SUPPORTED_NAME}\n"
+                    f"      found:     {'; '.join(sorted(seen))}\n"
+                    f"      Pump and fan duties in the service unit were checked "
+                    f"against the supported device only.",
+                    file=sys.stderr,
+                )
+                return 2
+        if time.monotonic() >= deadline:
+            print(
+                f"[hud] {SUPPORTED_NAME} did not appear on the USB bus "
+                f"within {timeout:.0f}s",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(1.0)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Kraken Elite telemetry HUD")
+    parser.add_argument(
+        "--wait-for-device",
+        type=float,
+        metavar="SECONDS",
+        help="wait for the supported cooler, then exit 0; refuse any other model",
+    )
     parser.add_argument(
         "--preview",
         action="store_true",
@@ -2094,6 +2158,11 @@ def main() -> int:
         help="print the active palette and every colour derived from it",
     )
     args = parser.parse_args()
+
+    # Checked before anything else: this is what the service units call to
+    # decide whether they are allowed to touch the hardware at all.
+    if args.wait_for_device is not None:
+        return wait_for_supported_device(args.wait_for_device)
 
     if args.dump_vocab:
         # The studio builds its metric menus and property panels from this,

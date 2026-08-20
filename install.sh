@@ -29,6 +29,30 @@ die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 # uninstall
 # --------------------------------------------------------------------------
 
+usage() {
+    cat <<USAGE
+Coldloop installer.
+
+    ./install.sh              install and start
+    ./install.sh --no-boot    install, but start at login instead of at boot
+    ./install.sh --uninstall  remove the units, desktop entry and icon
+    ./install.sh --help       this message
+USAGE
+}
+
+# Reject anything unrecognised rather than falling through to a full install.
+# Without this, a typo like --uninstal, or any flag this script does not know,
+# silently reinstalls -- which repoints the units and desktop entry at whatever
+# directory the script was run from.
+case "${1:-}" in
+    ""|--no-boot|--uninstall) ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf '\033[31merror:\033[0m unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+if [[ $# -gt 1 ]]; then
+    printf '\033[31merror:\033[0m too many arguments\n\n' >&2; usage >&2; exit 2
+fi
+
 if [[ "${1:-}" == "--uninstall" ]]; then
     say "Stopping and disabling services"
     for unit in "${UNITS[@]}"; do

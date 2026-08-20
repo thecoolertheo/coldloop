@@ -65,8 +65,69 @@ Note that `set lcd screen static` re-reads the device's stored orientation and
 brightness first (`_write([0x30,0x01])`), then resizes/rotates the image itself,
 so the HUD does not need to pre-rotate its own frames.
 
+## Lighting: the pump ring and the RGB fan chain
+
+Verified on 2026-08-20 on the real device, by watching the LEDs.
+
+The CLI **cannot** do this, and that is a liquidctl gap, not missing hardware:
+
+```
+liquidctl --match Kraken set ring color fixed 00ff00
+  -> ERROR: operation not supported by the device      # same for logo/external/sync/fan
+```
+
+`driver/kraken3.py` maps PID 0x3012 to `_COLOR_CHANNELS_KRAKEN2023`, which is
+`{}`, so `set_color()` raises `NotSupportedByDevice` before writing a byte.
+
+The LEDs are on the pump. `lsusb` shows exactly one NZXT device on the whole
+bus (`1e71:3012`), so nothing else could be driving them; the ASUS Aura
+controller (`0b05:19af`) drives motherboard headers only, and is out of scope.
+
+`coldloop_lighting.py` therefore speaks the Hue 2 direct protocol itself,
+applying liquidctl PR #882's logic at runtime to a driver instance it owns.
+**The installed package is never modified** -- `requirements.txt` pins
+liquidctl to match this file, and an in-place patch would falsify that pin and
+be erased by the next `pip install -r requirements.txt`.
+
+| Channel | id | Drives |
+| --- | --- | --- |
+| `ring` | `0b001` | the 40-slot pump ring around the LCD |
+| `external` | `0b010` | the RGB header the radiator fans chain into |
+| `sync` | `0b111` | both at once |
+
+Confirmed working, watched on the hardware:
+
+```
+python coldloop_lighting.py --channel ring     --mode static --colour '#ff0000'
+python coldloop_lighting.py --channel external --mode static --colour '#ff00ff'
+python coldloop_lighting.py --channel sync     --mode reactive
+python coldloop_lighting.py --off
+```
+
+Three things that are easy to get wrong:
+
+1. Use `super-fixed`, not `fixed`. The firmware's own animation path blinks a
+   "fixed" colour off periodically on this generation; per-LED writes hold.
+2. Per-LED data needs **two** reports. A 64-byte HID frame carries a 4-byte
+   header plus 20 RGB triplets, so LEDs 0-19 go under sub-command `0x10` and
+   LEDs 20-39 under `0x11`. Stock 1.16.0 sends everything under `0x10` and an
+   empty `0x11`, lighting only half the ring.
+3. Colours go on the wire as **GRB**, not RGB (`set_color()` reorders them).
+
+Do **not** call `initialize()` from the lighting path: it costs ~0.85s of
+blanked LCD, and its LED-info parser asserts on a channel count that only
+matches once the channels above are installed.
+
+Effects are computed host-side and streamed, because this firmware rejects its
+own animation modes. They therefore stop when the process stops, and colours
+reset on an AC power-cycle. Lighting writes take the same `flock` as every
+other device access; verified that a full colour sequence runs with the HUD
+service active and leaves it untouched (service `active`, no log entries,
+telemetry fresh).
+
 ## Not applicable to this device
 
-- `set <channel> color ...` exists but is unused by this project.
+- `set <channel> color ...` is rejected by the CLI for this PID; see the
+  lighting section above for what this project does instead.
 - `liquidctl --match Kraken set lcd screen gif` is rejected on 0x300E firmware
   2.x; irrelevant here (that guard only triggers for PID 0x300E).

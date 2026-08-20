@@ -6,6 +6,7 @@ Linux control for the NZXT Kraken 2024 Elite RGB (CAM is Windows-only), built on
 | File | Purpose |
 | --- | --- |
 | `kraken_hud.py` | Renders the telemetry HUD and pushes it to the 640x640 LCD in a loop |
+| `coldloop_lighting.py` | Pump-ring and fan-chain RGB (the only part that does not use the liquidctl CLI) |
 | `kraken_controller.py` | **Coldloop**, the PyQt6 control panel (hardware, gallery, editor, diagnostics) |
 | `liquidctl.service` | systemd `--user` unit; installed copy lives at `~/.config/systemd/user/` |
 | `VERIFIED_COMMANDS.md` | Ground-truth liquidctl syntax and duty limits for this device |
@@ -170,6 +171,45 @@ unreadable — a hex that looks good as a gauge fill is usually illegible as
 palette, and the "night" face's colours are checked against its own dark
 background rather than against white. The default teal is returned verbatim
 rather than regenerated, since those values were hand-tuned.
+
+## Lighting
+
+`coldloop_lighting.py` drives the cooler's own LEDs: the pump ring around the
+LCD, and the RGB header the radiator fans chain into.
+
+```
+python coldloop_lighting.py --channel ring     --mode static --colour '#22d3ee'
+python coldloop_lighting.py --channel external --mode breathing
+python coldloop_lighting.py --channel sync     --mode reactive   # colour tracks coolant
+python coldloop_lighting.py --off
+python coldloop_lighting.py --show
+```
+
+| Channel | Drives |
+| --- | --- |
+| `ring` | the pump ring around the display |
+| `external` | the RGB fan chain |
+| `sync` | both together |
+
+Modes are `static`, `off`, `breathing`, `pulse`, `spectrum` and `reactive`.
+Settings live in `~/.config/coldloop/lighting.json`.
+
+This is the one part of the suite that does **not** shell out to `liquidctl`,
+because the CLI refuses these commands — liquidctl 1.16.0 maps this cooler's
+PID to an empty colour-channel table, so `set ring color` fails before writing
+anything. The LEDs are on the pump regardless (the Kraken is the only NZXT
+device on the USB bus). This module applies the still-unmerged liquidctl PR
+\#882's Hue 2 logic at runtime to its own driver instance, and never modifies
+the installed package — patching `venv/` would falsify the pin in
+`requirements.txt` and be erased by the next `pip install -r requirements.txt`.
+`VERIFIED_COMMANDS.md` has the protocol details.
+
+Two consequences of how this generation's firmware works, neither fixable here:
+animated modes are computed on the host and streamed, so **they stop when the
+process stops**, and colours **reset on an AC power-cycle**. `static` and
+`reactive` write only when the colour actually changes, so they are the cheap
+ones; the animated modes hold the device open and are rate-capped to 5 fps so
+they do not starve the HUD's LCD pushes.
 
 ## Fan safety
 

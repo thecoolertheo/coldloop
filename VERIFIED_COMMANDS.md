@@ -118,6 +118,22 @@ Do **not** call `initialize()` from the lighting path: it costs ~0.85s of
 blanked LCD, and its LED-info parser asserts on a channel count that only
 matches once the channels above are installed.
 
+### ⚠️ The firmware does not retain per-LED state
+
+Measured on the real cooler: a solid colour written **once** begins corrupting
+after **20-30 seconds**, with a single LED on the ring and one on the fan chain
+reverting to green. Writing the same colour again clears it immediately, which
+is what proves this is decay of stored state rather than an addressing error —
+an unaddressed LED would never come good.
+
+Consequence: **every mode except `off` has to be held by a running process**,
+solid colours included. `coldloop_lighting.py` rewrites an unchanged colour
+every `REFRESH_SECONDS` (8s), comfortably inside the observed window. This is
+also why OpenKraken streams continuously instead of writing once.
+
+`--once` does a genuine single write. It is for testing the wire protocol, and
+its output says so; do not build on it.
+
 Effects are computed host-side and streamed, because this firmware rejects its
 own animation modes. They therefore stop when the process stops, and colours
 reset on an AC power-cycle. Lighting writes take the same `flock` as every

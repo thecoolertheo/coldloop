@@ -94,6 +94,9 @@ HUD_SCRIPT = HERE / "kraken_hud.py"
 LIGHTING_SCRIPT = HERE / "coldloop_lighting.py"
 CONTROLLER_SCRIPT = Path(__file__).resolve()
 SERVICE_NAME = "liquidctl.service"
+# Separate from the HUD service on purpose: lighting must never be able to
+# restart the unit that owns pump and fan duties.
+LIGHTING_SERVICE = "coldloop-lighting.service"
 SERVICE_UNIT = Path.home() / ".config" / "systemd" / "user" / SERVICE_NAME
 
 PYTHON = str(VENV_PYTHON if VENV_PYTHON.exists() else sys.executable)
@@ -126,13 +129,13 @@ LIGHT_MODE_LABELS = {
 }
 
 LIGHT_MODE_HINTS = {
-    "static": "One colour, held. Written once, so it costs the cooler nothing.",
+    "static": "One colour, held. Rewritten every few seconds, which the firmware needs.",
     "breathing": "Fades up and down. Computed here and streamed to the cooler.",
     "pulse": "Sharp flash decaying to dark, repeating. Streamed.",
     "spectrum": "Walks the whole colour wheel. Streamed; your colour is ignored.",
     "reactive": (
         "Colour follows coolant temperature, cool at 30°C through to hot at "
-        "45°C. Writes only when the colour actually changes."
+        "45°C."
     ),
 }
 
@@ -2441,19 +2444,61 @@ class Controller(QMainWindow):
             str(self.light_brightness.value()),
         ]
 
+    def _lighting_service_active(self) -> bool:
+        """Whether the lighting service is the one holding the LEDs.
+
+        This matters because the LEDs can only have one owner. If the service
+        is running and the window also spawned a holder, the two would rewrite
+        the ring in turn and it would visibly flicker between them. Same
+        arrangement as faces: the service owns the state, this window edits the
+        config the service reads.
+        """
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "is-active", LIGHTING_SERVICE],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.stdout.strip() == "active"
+
     def apply_lighting(self) -> None:
         mode = self.light_mode_box.currentData()
         channel = self.light_channel_box.currentData()
         self._stop_light_process()
         command = self._light_command(mode)
 
-        if mode not in lighting.STREAMED_MODES:
+        if self._lighting_service_active():
+            # Record the choice, then restart the holder so it picks it up.
+            self.dispatch(
+                f"Lighting {mode}",
+                command + ["--save-only"],
+                after=lambda *_: self.dispatch(
+                    "Restart lighting service",
+                    ["systemctl", "--user", "restart", LIGHTING_SERVICE],
+                    timeout=30.0,
+                ),
+                timeout=30.0,
+            )
+            label = lighting.CHANNEL_LABELS[channel]
+            self.light_state.setText(
+                f"{LIGHT_MODE_LABELS[mode]} on the {label}, held by the "
+                "lighting service — it survives closing this window."
+            )
+            return
+
+        if mode not in lighting.HELD_MODES:
             self.light_state.setText("")
             self.dispatch(f"Lighting {mode}", command, timeout=30.0)
             return
 
-        # Animated modes never exit on their own, so they cannot go through
-        # dispatch() -- that waits for completion and would hang the pool.
+        # Every mode except "off" has to be held: the firmware loses per-LED
+        # state within about half a minute, so even a solid colour needs a
+        # process rewriting it. Held modes never exit on their own and so
+        # cannot go through dispatch(), which waits for completion and would
+        # hang the thread pool.
         proc = QProcess(self)
         proc.finished.connect(lambda *_: self._on_light_process_finished(mode))
         proc.start(command[0], command[1:])
@@ -2464,8 +2509,9 @@ class Controller(QMainWindow):
         self.light_proc = proc
         label = lighting.CHANNEL_LABELS[channel]
         self.light_state.setText(
-            f"Running {LIGHT_MODE_LABELS[mode].lower()} on the {label}. "
-            "Animated modes are computed here and stop when Coldloop closes."
+            f"Holding {LIGHT_MODE_LABELS[mode].lower()} on the {label}. "
+            "The cooler forgets its lighting after about half a minute, so "
+            "Coldloop keeps rewriting it — the LEDs drift once this closes."
         )
         self.status.showMessage(f"Lighting {mode} — running", 4000)
 
@@ -2479,7 +2525,19 @@ class Controller(QMainWindow):
     def lighting_off(self) -> None:
         self._stop_light_process()
         self.light_state.setText("")
-        self.dispatch("Lighting off", self._light_command("off"), timeout=30.0)
+        if self._lighting_service_active():
+            # Stopping the service turns the LEDs off via its ExecStopPost, and
+            # leaves nothing behind to light them again.
+            self.dispatch(
+                "Lighting off",
+                ["systemctl", "--user", "stop", LIGHTING_SERVICE],
+                timeout=30.0,
+            )
+            return
+        # `--off` rather than `--mode off`, so switching the lights off does not
+        # overwrite the saved mode and leave the next start dark.
+        command = self._light_command(self.light_mode_box.currentData())
+        self.dispatch("Lighting off", command + ["--off"], timeout=30.0)
 
     def closeEvent(self, event) -> None:
         # Without this an animated mode would outlive the window, leaving an

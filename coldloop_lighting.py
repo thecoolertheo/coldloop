@@ -120,8 +120,29 @@ PALETTE_PATH = Path(
 
 # Modes computed here and streamed as per-LED frames, because this generation's
 # firmware rejects its own animation modes.
-STREAMED_MODES = ("breathing", "pulse", "spectrum", "reactive")
-MODES = ("static", "off") + STREAMED_MODES
+ANIMATED_MODES = ("breathing", "pulse", "spectrum")
+
+# Every mode except `off` has to be *held*, not written once.
+#
+# The firmware does not retain per-LED state: measured on the real cooler, a
+# solid colour written once starts corrupting after 20-30 seconds, with a
+# single LED on the ring and one on the fan chain reverting to green. Writing
+# the same colour again clears it, so this is decay of stored state rather than
+# an addressing mistake -- which is also why OpenKraken streams continuously
+# instead of writing once. `off` is exempt: a decayed LED goes green, and
+# green-when-it-should-be-dark is worth one stray LED rather than a process
+# running forever to keep the lights switched off.
+HELD_MODES = ("static", "reactive") + ANIMATED_MODES
+MODES = ("off",) + HELD_MODES
+
+# How often a held mode rewrites an unchanged colour. Comfortably inside the
+# observed 20-30s decay window without adding meaningful traffic: three 64-byte
+# reports, against the HUD's 2-second LCD pushes.
+REFRESH_SECONDS = 8.0
+
+# How often static and reactive wake up. They do not animate, so this only
+# bounds how quickly reactive notices a temperature change.
+SLOW_POLL_SECONDS = 2.0
 
 # Reactive endpoints in coolant degrees C: 30 is a typical idle for this loop,
 # 45 a sustained-load reading. Outside the range simply clamps.
@@ -303,11 +324,14 @@ def find_cooler():
 
 
 def set_colour(device, channel: str, colour: str, brightness: int = 100) -> None:
-    """Light one channel a single colour, held steady.
+    """Write one colour to every LED slot on a channel.
 
     Uses `super-fixed` rather than `fixed` because this generation's firmware
-    blinks a firmware-driven fixed colour off periodically; writing every LED
-    explicitly holds.
+    blinks a firmware-driven fixed colour off periodically.
+
+    This is a single write, and a single write does not last: the firmware
+    starts corrupting stored per-LED state after 20-30 seconds. Callers that
+    want a colour to stay put must keep calling this -- see `stream()`.
     """
     rgb = list(to_rgb(scale(colour, brightness / 100.0)))
     device.set_color(channel, "super-fixed", [rgb] * RING_LED_SLOTS)
@@ -395,34 +419,43 @@ def frame_colour(mode: str, base: str, elapsed: float) -> str | None:
 
 
 def stream(device, config: dict) -> int:
-    """Run a host-computed effect until interrupted.
+    """Hold a mode on the LEDs until interrupted.
 
-    This generation's firmware will not animate on its own, so every frame is a
-    full per-LED write sharing the cooler with the HUD's LCD pushes. That is
-    why the rate is capped and why identical frames are skipped.
+    This generation's firmware neither animates on its own nor retains per-LED
+    state, so every frame is a full per-LED write sharing the cooler with the
+    HUD's LCD pushes. Two things follow: animated modes are rate-capped, and
+    even an unchanged colour is rewritten every REFRESH_SECONDS, because
+    letting it sit turns one LED per channel green within half a minute.
     """
     channel, mode = config["channel"], config["mode"]
     base, brightness = config["colour"], config["brightness"]
-    fps = max(MIN_FPS, min(MAX_FPS, config["fps"]))
-    interval = 1.0 / fps
+    if mode in ANIMATED_MODES:
+        fps = max(MIN_FPS, min(MAX_FPS, config["fps"]))
+        interval = 1.0 / fps
+        rate = f"{fps:.1f} fps"
+    else:
+        interval = SLOW_POLL_SECONDS
+        rate = f"refreshed every {REFRESH_SECONDS:.0f}s"
 
-    print(f"{mode} on {CHANNEL_LABELS[channel]} at {fps:.1f} fps. Ctrl-C to stop.")
+    print(f"{mode} on {CHANNEL_LABELS[channel]}, {rate}. Ctrl-C to stop.")
     started = time.monotonic()
     last: str | None = None
+    last_write = 0.0
     try:
         while True:
-            colour = frame_colour(mode, base, time.monotonic() - started)
+            now = time.monotonic()
+            colour = frame_colour(mode, base, now - started)
             if colour is not None:
                 shown = scale(colour, brightness / 100.0)
-                # Reactive in particular sits on one colour for minutes;
-                # re-sending it would just steal device time from the HUD.
-                if shown != last:
+                # Skip identical frames to leave the device time for the HUD,
+                # but never for longer than the decay window.
+                if shown != last or (now - last_write) >= REFRESH_SECONDS:
                     with device_lock():
                         set_colour(device, channel, colour, brightness)
-                    last = shown
+                    last, last_write = shown, now
             time.sleep(interval)
     except KeyboardInterrupt:
-        print("\nstopped (the LEDs hold their last colour)")
+        print("\nstopped (LEDs will drift within ~30s without a holder)")
     return 0
 
 
@@ -447,7 +480,7 @@ def show(config: dict) -> int:
     return 0
 
 
-def apply(config: dict) -> int:
+def apply(config: dict, once: bool = False) -> int:
     device = find_cooler()
     if device is None:
         print("Kraken not found (expected USB 1e71:3012).", file=sys.stderr)
@@ -459,12 +492,15 @@ def apply(config: dict) -> int:
                 set_off(device, channel)
             print(f"{CHANNEL_LABELS[channel]}: off")
             return 0
-        if mode in STREAMED_MODES:
-            return stream(device, config)
-        with device_lock():
-            set_colour(device, channel, config["colour"], config["brightness"])
-        print(f"{CHANNEL_LABELS[channel]}: {config['colour']} at {config['brightness']}%")
-        return 0
+        if once:
+            # A single write, which the firmware starts corrupting within
+            # 20-30 seconds. Useful for testing the wire protocol; not how the
+            # lighting is meant to be driven.
+            with device_lock():
+                set_colour(device, channel, config["colour"], config["brightness"])
+            print(f"{CHANNEL_LABELS[channel]}: {config['colour']} (single write, will decay)")
+            return 0
+        return stream(device, config)
     finally:
         device.disconnect()
 
@@ -497,7 +533,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--brightness", type=int, metavar="0-100", help="host-side brightness")
     parser.add_argument("--fps", type=float, help=f"streamed effect rate ({MIN_FPS}-{MAX_FPS})")
     parser.add_argument("--apply", action="store_true", help="apply the saved settings now")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="write the colour a single time and exit; it decays within ~30s",
+    )
     parser.add_argument("--off", action="store_true", help="turn the selected channel off")
+    parser.add_argument(
+        "--save-only",
+        action="store_true",
+        help="write the settings to the config file without touching the LEDs",
+    )
     parser.add_argument("--show", action="store_true", help="print current settings")
     parser.add_argument("--probe", action="store_true", help="report what the cooler exposes")
     args = parser.parse_args(argv)
@@ -518,19 +564,30 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             parser.error(str(exc))
         dirty = True
-    if args.off:
-        config["mode"] = "off"
-        dirty = True
-
     if dirty:
         config["brightness"] = max(0, min(100, int(config["brightness"])))
         config["fps"] = max(MIN_FPS, min(MAX_FPS, float(config["fps"])))
         save_config(config)
 
+    if args.save_only:
+        # Lets a caller that does not own the LEDs -- the GUI, when the
+        # lighting service is the holder -- record a choice and then hand the
+        # actual writing to whoever does.
+        if not dirty:
+            save_config(config)
+        print(f"saved to {CONFIG_PATH}")
+        return 0
+
+    if args.off:
+        # Deliberately not saved. Turning the lights off is an action, not a
+        # preference: persisting it would mean the service's own ExecStopPost
+        # rewrote the saved mode to "off" and every later start came up dark.
+        return apply({**config, "mode": "off"})
+
     if args.show:
         return show(config)
-    if args.apply or dirty:
-        return apply(config)
+    if args.apply or args.once or dirty:
+        return apply(config, once=args.once)
     return show(config)
 
 

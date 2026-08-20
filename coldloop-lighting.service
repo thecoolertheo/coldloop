@@ -1,0 +1,40 @@
+[Unit]
+Description=Coldloop lighting for NZXT Kraken Elite (pump ring and fan chain)
+Documentation=file:///home/theo/liquidctl-env/VERIFIED_COMMANDS.md
+After=graphical-session.target
+
+# Same reasoning as liquidctl.service: cap restarts so a failing holder gives up
+# instead of respawning forever. These must live in [Unit]; systemd ignores them
+# in [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Why this is a long-running service and not a one-shot command:
+#
+# The Kraken's firmware does not retain per-LED state. A colour written once
+# starts corrupting after 20-30 seconds -- one LED on the ring and one on the
+# fan chain revert to green. Rewriting the same colour clears it, so the
+# lighting has to be *held*, not set. This process rewrites it every 8 seconds.
+#
+# It reads ~/.config/coldloop/lighting.json, the same file Coldloop's Lighting
+# tab writes, so changing the mode there is a `systemctl --user restart` away.
+#
+# This deliberately does NOT run `liquidctl initialize` or touch pump and fan
+# duties. Cooling belongs to liquidctl.service alone; nothing about lighting
+# should be able to change how hard the fans run.
+ExecStart=/home/theo/liquidctl-env/venv/bin/python \
+    /home/theo/liquidctl-env/coldloop_lighting.py --apply
+
+# Leave the LEDs dark rather than holding a half-decayed colour once nothing is
+# refreshing them. `-` so a failure here cannot block the stop.
+ExecStopPost=-/home/theo/liquidctl-env/venv/bin/python \
+    /home/theo/liquidctl-env/coldloop_lighting.py --off
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

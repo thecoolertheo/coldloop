@@ -8,7 +8,8 @@ Linux control for the NZXT Kraken 2024 Elite RGB (CAM is Windows-only), built on
 | `kraken_hud.py` | Renders the telemetry HUD and pushes it to the 640x640 LCD in a loop |
 | `coldloop_lighting.py` | Pump-ring and fan-chain RGB (the only part that does not use the liquidctl CLI) |
 | `kraken_controller.py` | **Coldloop**, the PyQt6 control panel (hardware, gallery, editor, diagnostics) |
-| `liquidctl.service` | systemd `--user` unit; installed copy lives at `~/.config/systemd/user/` |
+| `liquidctl.service` | systemd `--user` unit for the HUD; installed copy lives at `~/.config/systemd/user/` |
+| `coldloop-lighting.service` | systemd `--user` unit that holds the LED colour (the firmware forgets it) |
 | `VERIFIED_COMMANDS.md` | Ground-truth liquidctl syntax and duty limits for this device |
 
 The controller is in the GNOME app grid and dock as **Coldloop**
@@ -195,11 +196,37 @@ python coldloop_lighting.py --show
 Modes are `static`, `off`, `breathing`, `pulse`, `spectrum` and `reactive`.
 Settings live in `~/.config/coldloop/lighting.json`.
 
-The animated modes never exit on their own, so the GUI runs them as a child
-process rather than through `dispatch()`, which waits for completion and would
-hang its thread pool. Switching mode, turning the lighting off, or closing the
-window all stop that process — otherwise it would outlive the window and hold
-the cooler with no way to stop it from the UI.
+**The cooler forgets its lighting.** Measured: a colour written once starts
+corrupting after 20-30 seconds, one LED on the ring and one on the fan chain
+turning green. Rewriting the same colour fixes it instantly, which is what
+shows this is decay rather than an LED we never addressed. So every mode
+except `off` is *held* by a running process that rewrites it every 8 seconds —
+solid colours included. `--once` does a single write and says in its output
+that it will decay; it exists for testing the protocol.
+
+That means lighting lasts only as long as something is holding it, so
+`coldloop-lighting.service` does the holding:
+
+```
+systemctl --user status  coldloop-lighting.service
+systemctl --user stop    coldloop-lighting.service   # also turns the LEDs off
+systemctl --user disable --now coldloop-lighting.service
+```
+
+It is a separate unit from `liquidctl.service` on purpose: nothing about
+lighting should be able to restart the unit that owns pump and fan duties, and
+this one never runs `initialize` or touches a duty.
+
+The LEDs can only have one owner, so when that service is running the Lighting
+tab writes `lighting.json` and restarts it rather than lighting the ring
+itself — the same arrangement faces already use. With the service stopped, the
+window holds the lighting directly for as long as it is open.
+
+Held modes never exit on their own, so the GUI runs them as a child process
+rather than through `dispatch()`, which waits for completion and would hang its
+thread pool. Switching mode, turning the lighting off, or closing the window
+all stop that process — otherwise it would outlive the window and hold the
+cooler with no way to stop it from the UI.
 
 This is the one part of the suite that does **not** shell out to `liquidctl`,
 because the CLI refuses these commands — liquidctl 1.16.0 maps this cooler's

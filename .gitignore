@@ -1,0 +1,14 @@
+# The virtualenv is rebuilt from requirements.txt, never committed: it is
+# ~200MB of platform-specific binary wheels, and it contains liquidctl, whose
+# GPL-3.0-or-later terms would attach to anything redistributing it.
+venv/
+
+__pycache__/
+*.pyc
+
+# Editor backups the suite's own script editor writes next to the originals.
+*.bak
+
+# Rendered frames and preview images are build output, not source.
+*.png
+hud_preview.png

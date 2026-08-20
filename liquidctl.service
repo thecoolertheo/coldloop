@@ -1,0 +1,40 @@
+[Unit]
+Description=Coldloop HUD for NZXT Kraken Elite (liquidctl)
+Documentation=file:///home/theo/liquidctl-env/VERIFIED_COMMANDS.md
+After=graphical-session.target
+
+# A crash loop here previously combined with an unsafe hardware command to make
+# the machine unusable across reboots. These caps mean systemd gives up instead
+# of reapplying a bad state forever; `systemctl --user reset-failed` clears it.
+# They must live in [Unit]: systemd ignores them in [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Initialize the device, then apply a cooling baseline.
+#
+# Fan is set as a temperature/duty curve rather than a flat value. Every point
+# is at or above 30%: the fan channel's driver minimum is 0, and
+# `set fan speed 0` is accepted silently with exit status 0 while stopping the
+# radiator fans. Because this unit reapplies its settings at every start, any
+# unsafe value here would be reinstated on every login. Keep every duty in this
+# line >= 30.
+#
+# Curve points are interpolated by liquidctl over 20-59 C (_CRITICAL_TEMPERATURE).
+ExecStartPre=/home/theo/liquidctl-env/venv/bin/liquidctl initialize all
+ExecStartPre=/home/theo/liquidctl-env/venv/bin/liquidctl --match Kraken set pump speed 75
+ExecStartPre=/home/theo/liquidctl-env/venv/bin/liquidctl --match Kraken set fan speed 20 30 30 45 40 70 50 100
+
+ExecStart=/home/theo/liquidctl-env/venv/bin/python /home/theo/liquidctl-env/kraken_hud.py
+
+# Hand the LCD back to the firmware's native display when the HUD stops, so a
+# stopped service does not leave a frozen frame on the screen.
+ExecStopPost=-/home/theo/liquidctl-env/venv/bin/liquidctl --match Kraken set lcd screen liquid
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

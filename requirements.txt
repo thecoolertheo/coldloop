@@ -1,0 +1,30 @@
+# Coldloop dependencies, pinned to the versions this suite was verified
+# against on the real device.
+#
+# liquidctl's version matters more than the rest: VERIFIED_COMMANDS.md records
+# command syntax and duty limits checked against *this* release's driver, and
+# the fan channel's minimum of 0 is a thermal hazard if a future version
+# changes how duties are validated. Re-verify against the real cooler before
+# moving that pin.
+#
+#   python -m venv venv
+#   ./venv/bin/pip install -r requirements.txt
+
+# --- direct imports ---
+numpy==2.5.1
+pillow==12.3.0
+psutil==7.2.2
+PyQt6==6.11.0
+
+# --- invoked as a CLI, not imported ---
+liquidctl==1.16.0
+
+# --- transitive; pinned so the environment is reproducible ---
+colorlog==6.12.0
+crcmod==1.7
+docopt==0.6.2
+hidapi==0.15.0
+PyQt6-Qt6==6.11.1
+PyQt6_sip==13.11.1
+pyusb==1.3.1
+smbus2==0.6.1

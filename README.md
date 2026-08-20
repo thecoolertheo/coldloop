@@ -3,6 +3,12 @@
 Linux control for the NZXT Kraken 2024 Elite RGB (CAM is Windows-only), built on
 [liquidctl](https://github.com/liquidctl/liquidctl).
 
+![Eight built-in HUD faces on the cooler's round LCD](docs/faces.png)
+
+Eight built-in faces, rendered by `kraken_hud.py` and pushed to the cooler's
+round 640x640 LCD. Each is drawn from three colours you pick, and you can build
+your own by dragging components onto the display.
+
 > **Supported hardware: one cooler.** Everything here was verified against an
 > **NZXT Kraken 2024 Elite RGB (USB `1e71:3012`)** on Bazzite. Coldloop refuses
 > to configure any other cooler rather than guess — its pump and fan curves are
@@ -64,6 +70,8 @@ lighting settings in `~/.config/coldloop/` are left alone.
 The controller is in the GNOME app grid and dock as **Coldloop**
 (`~/.local/share/applications/coldloop.desktop`, icon
 `~/.local/share/icons/hicolor/scalable/apps/coldloop.svg`).
+
+![The Gallery tab, with live previews of each face](docs/gallery-tab.png)
 
 Both processes serialise device access through a shared `flock` on
 `/dev/shm/kraken_liquidctl.lock`, and the HUD publishes its latest reading to
@@ -202,6 +210,8 @@ failure.
 
 ## Building your own face
 
+![The face studio: components on the left, the round display in the middle, per-component properties on the right](docs/face-studio.png)
+
 The Gallery tab's **Create a face** button opens a studio: drag arc gauges,
 bar meters, live readouts and text labels onto the round display, drag them to
 position, and set each one's metric, colour, size and weight individually.
@@ -260,6 +270,8 @@ background rather than against white. The default teal is returned verbatim
 rather than regenerated, since those values were hand-tuned.
 
 ## Lighting
+
+![The Lighting tab: channel, mode, colour and brightness](docs/lighting-tab.png)
 
 Coldloop's **Lighting** tab drives the cooler's own LEDs: the pump ring around
 the LCD, and the RGB header the radiator fans chain into. Pick what to light,
@@ -361,6 +373,8 @@ constant passes vacuously the moment somebody lowers that constant, which is
 exactly the change worth catching.
 
 ## Fan safety
+
+![The Hardware tab: pump and fan duty, with the fan slider floored at 25%](docs/hardware-tab.png)
 
 The fan channel's driver minimum is **0**, and `liquidctl set fan speed 0` is
 accepted silently with exit status 0 while stopping the radiator fans — it looks

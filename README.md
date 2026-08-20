@@ -44,6 +44,7 @@ lighting settings in `~/.config/coldloop/` are left alone.
 | `liquidctl.service.in` | systemd `--user` unit template for the HUD; `install.sh` fills in the path |
 | `coldloop-lighting.service.in` | unit template that holds the LED colour (the firmware forgets it) |
 | `install.sh` | Installs/uninstalls the venv, units, desktop entry and icon |
+| `tests/` | Fan-safety guards; `python -m unittest discover -s tests` |
 | `compat/smbus.py` | Pure-python stand-in for the C extension liquidctl declares |
 | `VERIFIED_COMMANDS.md` | Ground-truth liquidctl syntax and duty limits for this device |
 
@@ -328,6 +329,23 @@ process stops**, and colours **reset on an AC power-cycle**. `static` and
 `reactive` write only when the colour actually changes, so they are the cheap
 ones; the animated modes hold the device open and are rate-capped to 5 fps so
 they do not starve the HUD's LCD pushes.
+
+## Tests
+
+```
+venv/bin/python -m unittest discover -s tests -v
+```
+
+Stdlib `unittest`, so running them needs nothing `requirements.txt` does not
+already pin. They cover the fan-safety invariants below and nothing else — this
+is a guard on the one failure mode that can damage hardware, not a general test
+suite.
+
+Each test was checked by mutation: breaking the thing it guards makes it fail.
+That is why they assert against a policy floor defined in the test file rather
+than against `FAN_MIN_SAFE` itself — a test that compares the code to its own
+constant passes vacuously the moment somebody lowers that constant, which is
+exactly the change worth catching.
 
 ## Fan safety
 

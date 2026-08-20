@@ -27,7 +27,7 @@ Linux control for the NZXT Kraken 2024 Elite RGB (CAM is Windows-only), built on
 ## Install
 
 ```
-git clone <repo-url> coldloop && cd coldloop
+git clone https://github.com/thecoolertheo/coldloop.git && cd coldloop
 ./install.sh
 ```
 

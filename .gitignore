@@ -11,4 +11,7 @@ __pycache__/
 
 # Rendered frames and preview images are build output, not source.
 *.png
-hud_preview.png
+
+# ...but screenshots for the README are source. Without this exception the
+# `*.png` rule above silently swallows them and `git add` appears to do nothing.
+!docs/*.png

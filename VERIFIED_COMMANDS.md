@@ -134,6 +134,12 @@ also why OpenKraken streams continuously instead of writing once.
 `--once` does a genuine single write. It is for testing the wire protocol, and
 its output says so; do not build on it.
 
+The holder re-reads `lighting.json` whenever its mtime changes, so a colour
+change needs no restart. Do not remove that: a holder that reads its config
+only at startup keeps rewriting the original colour every 8 seconds and
+silently overwrites anything applied afterwards, which presents as lighting
+that cannot be changed at all.
+
 Effects are computed host-side and streamed, because this firmware rejects its
 own animation modes. They therefore stop when the process stops, and colours
 reset on an AC power-cycle. Lighting writes take the same `flock` as every

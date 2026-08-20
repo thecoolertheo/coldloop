@@ -217,10 +217,22 @@ It is a separate unit from `liquidctl.service` on purpose: nothing about
 lighting should be able to restart the unit that owns pump and fan duties, and
 this one never runs `initialize` or touches a duty.
 
+The holder **watches `lighting.json`** and picks changes up within a couple of
+seconds, exactly as the HUD watches `face.json`. That is load-bearing, not a
+nicety: when the config was only read at startup, the holder sat rewriting its
+original colour every 8 seconds and silently overwrote everything applied
+afterwards — the lighting looked stuck on one colour no matter what you chose.
+
 The LEDs can only have one owner, so when that service is running the Lighting
-tab writes `lighting.json` and restarts it rather than lighting the ring
-itself — the same arrangement faces already use. With the service stopped, the
-window holds the lighting directly for as long as it is open.
+tab only writes `lighting.json` rather than lighting the ring itself — the same
+arrangement faces already use. It deliberately does not restart the service,
+which would blink the LEDs off and back via `ExecStopPost`. With the service
+stopped, the window holds the lighting directly for as long as it is open.
+
+Turning the lights off from the GUI saves `mode: "off"`, which the holder picks
+up while staying alive, so Apply can turn them back on. The `--off` *flag* is a
+one-shot darkening that is deliberately never saved — it is what `ExecStopPost`
+uses, and persisting it would make every later start come up dark.
 
 Held modes never exit on their own, so the GUI runs them as a child process
 rather than through `dispatch()`, which waits for completion and would hang its

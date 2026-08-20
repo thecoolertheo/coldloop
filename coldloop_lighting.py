@@ -418,34 +418,74 @@ def frame_colour(mode: str, base: str, elapsed: float) -> str | None:
     return base
 
 
+def config_mtime() -> float:
+    try:
+        return CONFIG_PATH.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def stream(device, config: dict) -> int:
-    """Hold a mode on the LEDs until interrupted.
+    """Hold the configured mode on the LEDs until interrupted.
 
     This generation's firmware neither animates on its own nor retains per-LED
     state, so every frame is a full per-LED write sharing the cooler with the
     HUD's LCD pushes. Two things follow: animated modes are rate-capped, and
     even an unchanged colour is rewritten every REFRESH_SECONDS, because
     letting it sit turns one LED per channel green within half a minute.
-    """
-    channel, mode = config["channel"], config["mode"]
-    base, brightness = config["colour"], config["brightness"]
-    if mode in ANIMATED_MODES:
-        fps = max(MIN_FPS, min(MAX_FPS, config["fps"]))
-        interval = 1.0 / fps
-        rate = f"{fps:.1f} fps"
-    else:
-        interval = SLOW_POLL_SECONDS
-        rate = f"refreshed every {REFRESH_SECONDS:.0f}s"
 
-    print(f"{mode} on {CHANNEL_LABELS[channel]}, {rate}. Ctrl-C to stop.")
+    The config file is re-read whenever its mtime changes, the same way the HUD
+    watches face.json. Without that, this process would hold whatever it read
+    at startup and silently ignore every later change -- which is exactly what
+    happened when only a restart could update it: the holder sat rewriting its
+    original colour every 8 seconds and overwrote anything else applied.
+    """
+    channel = config["channel"]
+    seen_mtime = config_mtime()
+
+    def pacing() -> tuple[float, str]:
+        if config["mode"] in ANIMATED_MODES:
+            fps = max(MIN_FPS, min(MAX_FPS, config["fps"]))
+            return 1.0 / fps, f"{fps:.1f} fps"
+        return SLOW_POLL_SECONDS, f"refreshed every {REFRESH_SECONDS:.0f}s"
+
+    interval, rate = pacing()
+    print(f"{config['mode']} on {CHANNEL_LABELS[channel]}, {rate}. Ctrl-C to stop.", flush=True)
+
     started = time.monotonic()
     last: str | None = None
     last_write = 0.0
     try:
         while True:
+            mtime = config_mtime()
+            if mtime != seen_mtime:
+                seen_mtime = mtime
+                fresh = load_config()
+                if fresh["channel"] != channel:
+                    # The channel we are leaving would otherwise keep its last
+                    # colour and decay to green with nothing refreshing it.
+                    with device_lock():
+                        set_off(device, channel)
+                config = fresh
+                channel = config["channel"]
+                interval, rate = pacing()
+                # Restart the animation phase and force a write, so a change
+                # takes effect now rather than at the next refresh.
+                started, last, last_write = time.monotonic(), None, 0.0
+                print(f"{config['mode']} on {CHANNEL_LABELS[channel]}, {rate}", flush=True)
+
             now = time.monotonic()
-            colour = frame_colour(mode, base, now - started)
+            if config["mode"] == "off":
+                if last != "off":
+                    with device_lock():
+                        set_off(device, channel)
+                    last = "off"
+                time.sleep(SLOW_POLL_SECONDS)
+                continue
+
+            colour = frame_colour(config["mode"], config["colour"], now - started)
             if colour is not None:
+                brightness = config["brightness"]
                 shown = scale(colour, brightness / 100.0)
                 # Skip identical frames to leave the device time for the HUD,
                 # but never for longer than the decay window.
@@ -487,19 +527,20 @@ def apply(config: dict, once: bool = False) -> int:
         return 1
     try:
         channel, mode = config["channel"], config["mode"]
-        if mode == "off":
-            with device_lock():
-                set_off(device, channel)
-            print(f"{CHANNEL_LABELS[channel]}: off")
-            return 0
         if once:
-            # A single write, which the firmware starts corrupting within
-            # 20-30 seconds. Useful for testing the wire protocol; not how the
-            # lighting is meant to be driven.
+            # A single write. For a colour the firmware starts corrupting it
+            # within 20-30 seconds, so this is for testing the wire protocol
+            # and for the service's ExecStopPost -- not how lighting is driven.
             with device_lock():
-                set_colour(device, channel, config["colour"], config["brightness"])
-            print(f"{CHANNEL_LABELS[channel]}: {config['colour']} (single write, will decay)")
+                if mode == "off":
+                    set_off(device, channel)
+                else:
+                    set_colour(device, channel, config["colour"], config["brightness"])
+            detail = "off" if mode == "off" else f"{config['colour']} (single write, will decay)"
+            print(f"{CHANNEL_LABELS[channel]}: {detail}")
             return 0
+        # "off" is held rather than written once so that the holder stays alive
+        # to notice the config being changed back.
         return stream(device, config)
     finally:
         device.disconnect()
@@ -579,10 +620,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.off:
-        # Deliberately not saved. Turning the lights off is an action, not a
-        # preference: persisting it would mean the service's own ExecStopPost
-        # rewrote the saved mode to "off" and every later start came up dark.
-        return apply({**config, "mode": "off"})
+        # A one-shot darkening, deliberately not saved: persisting it would
+        # mean the service's own ExecStopPost rewrote the saved mode to "off"
+        # and every later start came up dark. To turn the lights off *durably*
+        # save mode="off" instead, which a running holder picks up live.
+        return apply({**config, "mode": "off"}, once=True)
 
     if args.show:
         return show(config)

@@ -2471,17 +2471,11 @@ class Controller(QMainWindow):
         command = self._light_command(mode)
 
         if self._lighting_service_active():
-            # Record the choice, then restart the holder so it picks it up.
-            self.dispatch(
-                f"Lighting {mode}",
-                command + ["--save-only"],
-                after=lambda *_: self.dispatch(
-                    "Restart lighting service",
-                    ["systemctl", "--user", "restart", LIGHTING_SERVICE],
-                    timeout=30.0,
-                ),
-                timeout=30.0,
-            )
+            # Just record the choice: the service watches this file and picks
+            # changes up within a couple of seconds, so it needs no restart --
+            # and restarting it would blink the LEDs off and back via its
+            # ExecStopPost.
+            self.dispatch(f"Lighting {mode}", command + ["--save-only"], timeout=30.0)
             label = lighting.CHANNEL_LABELS[channel]
             self.light_state.setText(
                 f"{LIGHT_MODE_LABELS[mode]} on the {label}, held by the "
@@ -2526,13 +2520,11 @@ class Controller(QMainWindow):
         self._stop_light_process()
         self.light_state.setText("")
         if self._lighting_service_active():
-            # Stopping the service turns the LEDs off via its ExecStopPost, and
-            # leaves nothing behind to light them again.
-            self.dispatch(
-                "Lighting off",
-                ["systemctl", "--user", "stop", LIGHTING_SERVICE],
-                timeout=30.0,
-            )
+            # Save mode="off" rather than stopping the service: the holder
+            # picks it up live and stays running, so Apply can turn the LEDs
+            # back on without having to start a service first.
+            command = self._light_command("off")
+            self.dispatch("Lighting off", command + ["--save-only"], timeout=30.0)
             return
         # `--off` rather than `--mode off`, so switching the lights off does not
         # overwrite the saved mode and leave the next start dark.

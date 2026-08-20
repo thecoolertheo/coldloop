@@ -11,6 +11,19 @@ Linux control for the NZXT Kraken 2024 Elite RGB (CAM is Windows-only), built on
 > ([liquidctl#882](https://github.com/liquidctl/liquidctl/pull/882)); there is
 > no official NZXT specification for it.
 
+> **Written with Claude.** Essentially all of the code, tests and documentation
+> here were written by Anthropic's Claude (Claude Code), directed by me across a
+> series of sessions. I chose what to build, ran everything against the real
+> cooler, and reported the bugs that shaped it — the RGB ring's colour decay,
+> the LEDs refusing to change, the fan-stopping hazard — but I did not
+> hand-write the implementation. Every commit carries a `Co-Authored-By: Claude`
+> trailer, so the history says the same thing.
+>
+> Treat it the way you would any code you did not write yourself: the fan-safety
+> path is covered by tests and the hardware behaviour was verified on a real
+> device, but read `VERIFIED_COMMANDS.md` before changing anything that talks to
+> the cooler.
+
 ## Install
 
 ```

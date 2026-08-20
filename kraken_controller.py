@@ -25,6 +25,7 @@ from pathlib import Path
 from PyQt6.QtCore import (
     QEasingCurve,
     QMimeData,
+    QProcess,
     QSize,
     QObject,
     QPropertyAnimation,
@@ -90,6 +91,7 @@ HERE = Path(__file__).resolve().parent
 VENV_PYTHON = HERE / "venv" / "bin" / "python"
 LIQUIDCTL = HERE / "venv" / "bin" / "liquidctl"
 HUD_SCRIPT = HERE / "kraken_hud.py"
+LIGHTING_SCRIPT = HERE / "coldloop_lighting.py"
 CONTROLLER_SCRIPT = Path(__file__).resolve()
 SERVICE_NAME = "liquidctl.service"
 SERVICE_UNIT = Path.home() / ".config" / "systemd" / "user" / SERVICE_NAME
@@ -97,6 +99,42 @@ SERVICE_UNIT = Path.home() / ".config" / "systemd" / "user" / SERVICE_NAME
 PYTHON = str(VENV_PYTHON if VENV_PYTHON.exists() else sys.executable)
 LIQ = str(LIQUIDCTL if LIQUIDCTL.exists() else "liquidctl")
 MATCH = "Kraken"
+
+# The lighting vocabulary is imported rather than duplicated, so the page can
+# never offer a channel or mode the renderer cannot drive.
+#
+# The import is guarded because coldloop_lighting raises SystemExit when it
+# cannot import liquidctl, and an unguarded SystemExit at import time would
+# take the whole GUI down over an optional, cosmetic feature. When it fails the
+# Lighting page says so instead of silently disappearing.
+try:
+    import coldloop_lighting as lighting
+except (ImportError, SystemExit) as exc:  # pragma: no cover - environment
+    lighting = None
+    LIGHTING_ERROR = str(exc) or "coldloop_lighting could not be imported"
+else:
+    LIGHTING_ERROR = ""
+
+# Plain-language names and the one thing worth knowing about each mode. The
+# keys must exist in coldloop_lighting.MODES; the page only offers these.
+LIGHT_MODE_LABELS = {
+    "static": "Solid colour",
+    "breathing": "Breathing",
+    "pulse": "Pulse",
+    "spectrum": "Spectrum cycle",
+    "reactive": "Coolant temperature",
+}
+
+LIGHT_MODE_HINTS = {
+    "static": "One colour, held. Written once, so it costs the cooler nothing.",
+    "breathing": "Fades up and down. Computed here and streamed to the cooler.",
+    "pulse": "Sharp flash decaying to dark, repeating. Streamed.",
+    "spectrum": "Walks the whole colour wheel. Streamed; your colour is ignored.",
+    "reactive": (
+        "Colour follows coolant temperature, cool at 30°C through to hot at "
+        "45°C. Writes only when the colour actually changes."
+    ),
+}
 
 # Duty limits come from the driver's own channel table
 # (_SPEED_CHANNELS_KRAKEN2023): pump is clamped to 20-100, fan to 0-100.
@@ -1399,6 +1437,10 @@ class Controller(QMainWindow):
         self._service_active = False
         self._service_enabled = False
         self._duty_synced = False
+        # Holds the child process for an animated lighting mode. Those modes
+        # are computed on the host and run until stopped, so unlike everything
+        # else in this window they are a long-lived process, not a one-shot.
+        self.light_proc: QProcess | None = None
 
         root = QWidget()
         root.setObjectName("Root")
@@ -1418,7 +1460,7 @@ class Controller(QMainWindow):
         self.nav.setObjectName("Nav")
         self.nav.setFixedWidth(178)
         self.nav.setFrameShape(QFrame.Shape.NoFrame)
-        for name in ("Hardware", "Gallery", "Script Editor", "Diagnostics"):
+        for name in ("Hardware", "Gallery", "Lighting", "Script Editor", "Diagnostics"):
             QListWidgetItem(name, self.nav)
         self.nav.setCurrentRow(0)
         self.nav.currentRowChanged.connect(self._on_nav_changed)
@@ -1428,6 +1470,7 @@ class Controller(QMainWindow):
         body.addWidget(self.pages, 1)
         self.pages.addWidget(scrollable(self._build_hardware_page()))
         self.pages.addWidget(scrollable(self._build_gallery_page()))
+        self.pages.addWidget(scrollable(self._build_lighting_page()))
         self.pages.addWidget(self._build_editor_page())
         self.pages.addWidget(self._build_diagnostics_page())
 
@@ -2219,6 +2262,230 @@ class Controller(QMainWindow):
             timeout=30.0,
             after=then_push,
         )
+
+    # -- lighting --------------------------------------------------------
+
+    def _build_lighting_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("Root")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 6, 0)
+        layout.setSpacing(18)
+
+        frame, cl = make_card()
+        layout.addWidget(frame)
+
+        title = QLabel("Lighting")
+        title.setStyleSheet(f"font-size: 15px; font-weight: 700; color: {TEXT};")
+        cl.addWidget(title)
+
+        if lighting is None:
+            # Better to explain than to hide the page: a missing feature with
+            # no reason given reads as a bug.
+            broken = QLabel(
+                "Lighting is unavailable because the lighting module could not "
+                f"be loaded:\n{LIGHTING_ERROR}"
+            )
+            broken.setObjectName("Warn")
+            broken.setWordWrap(True)
+            cl.addWidget(broken)
+            layout.addStretch(1)
+            return page
+
+        hint = QLabel(
+            "The ring around the display and the RGB fan chain, driven straight "
+            "from the pump. liquidctl cannot do this, so Coldloop speaks the "
+            "protocol itself."
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        cl.addWidget(hint)
+
+        self.light_config = lighting.load_config()
+
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        what = QLabel("Light up")
+        what.setObjectName("RowLabel")
+        what.setMinimumWidth(92)
+        self.light_channel_box = QComboBox()
+        for key in ("ring", "external", "sync"):
+            label = lighting.CHANNEL_LABELS[key]
+            # Upper-case the first letter only -- str.capitalize() would lower
+            # the rest and turn "RGB fan chain" into "Rgb fan chain".
+            self.light_channel_box.addItem(label[:1].upper() + label[1:], key)
+        index = self.light_channel_box.findData(self.light_config["channel"])
+        if index >= 0:
+            self.light_channel_box.setCurrentIndex(index)
+        row.addWidget(what)
+        row.addWidget(self.light_channel_box, 1)
+        cl.addLayout(row)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(14)
+        mode_label = QLabel("Mode")
+        mode_label.setObjectName("RowLabel")
+        mode_label.setMinimumWidth(92)
+        self.light_mode_box = QComboBox()
+        for key in ("static", "breathing", "pulse", "spectrum", "reactive"):
+            self.light_mode_box.addItem(LIGHT_MODE_LABELS[key], key)
+        index = self.light_mode_box.findData(self.light_config["mode"])
+        if index >= 0:
+            self.light_mode_box.setCurrentIndex(index)
+        self.light_mode_box.currentIndexChanged.connect(self._on_light_mode_changed)
+        mode_row.addWidget(mode_label)
+        mode_row.addWidget(self.light_mode_box, 1)
+        cl.addLayout(mode_row)
+
+        self.light_mode_hint = QLabel()
+        self.light_mode_hint.setObjectName("Hint")
+        self.light_mode_hint.setWordWrap(True)
+        cl.addWidget(self.light_mode_hint)
+
+        colour_row = QHBoxLayout()
+        colour_row.setSpacing(14)
+        self.light_colour_label = QLabel("Colour")
+        self.light_colour_label.setObjectName("RowLabel")
+        self.light_colour_label.setMinimumWidth(92)
+        self.light_swatch = QPushButton()
+        self.light_swatch.setFixedHeight(38)
+        self.light_swatch.clicked.connect(self.pick_light_colour)
+        colour_row.addWidget(self.light_colour_label)
+        colour_row.addWidget(self.light_swatch, 1)
+        cl.addLayout(colour_row)
+
+        self.light_brightness = self._slider_row(
+            cl, "Brightness", 0, 100, int(self.light_config["brightness"])
+        )
+
+        cl.addWidget(divider())
+
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        apply_button = QPushButton("Apply")
+        apply_button.clicked.connect(self.apply_lighting)
+        actions.addWidget(apply_button)
+        off_button = QPushButton("Turn off")
+        off_button.setObjectName("Ghost")
+        off_button.clicked.connect(self.lighting_off)
+        actions.addWidget(off_button)
+        actions.addStretch(1)
+        cl.addLayout(actions)
+
+        self.light_state = QLabel()
+        self.light_state.setObjectName("Hint")
+        self.light_state.setWordWrap(True)
+        cl.addWidget(self.light_state)
+
+        self._refresh_light_swatch()
+        self._on_light_mode_changed()
+        layout.addStretch(1)
+        return page
+
+    def _refresh_light_swatch(self) -> None:
+        colour = self.light_config["colour"]
+        # Same reason as the palette swatches: a dark colour with dark text on
+        # it leaves the button looking blank.
+        ink = "#000000" if QColor(colour).lightnessF() > 0.55 else "#ffffff"
+        self.light_swatch.setText(colour.upper())
+        self.light_swatch.setStyleSheet(
+            f"background: {colour}; color: {ink}; border: none;"
+            f"border-radius: 10px; font-weight: 700;"
+        )
+
+    def _on_light_mode_changed(self) -> None:
+        mode = self.light_mode_box.currentData()
+        self.light_mode_hint.setText(LIGHT_MODE_HINTS[mode])
+        # Reactive derives its colour from coolant temperature and spectrum
+        # walks the whole wheel, so a base colour would be ignored. Hiding the
+        # control is honest; leaving it enabled would imply it does something.
+        uses_colour = mode not in ("reactive", "spectrum")
+        self.light_swatch.setVisible(uses_colour)
+        self.light_colour_label.setVisible(uses_colour)
+
+    def pick_light_colour(self) -> None:
+        chosen = QColorDialog.getColor(
+            QColor(self.light_config["colour"]), self, "Choose lighting colour"
+        )
+        if not chosen.isValid():
+            return  # cancelled -- leave the colour untouched
+        self.light_config["colour"] = chosen.name().lower()
+        self._refresh_light_swatch()
+
+    def _stop_light_process(self) -> None:
+        """Stop any running animated mode.
+
+        Animated modes are a child process holding the cooler open; starting a
+        second one would have two processes fighting over the same LEDs.
+        """
+        proc, self.light_proc = self.light_proc, None
+        if proc is None:
+            return
+        proc.terminate()
+        if not proc.waitForFinished(3000):
+            proc.kill()
+            proc.waitForFinished(1000)
+
+    def _light_command(self, mode: str) -> list[str]:
+        config = self.light_config
+        return [
+            PYTHON,
+            str(LIGHTING_SCRIPT),
+            "--channel",
+            self.light_channel_box.currentData(),
+            "--mode",
+            mode,
+            "--colour",
+            config["colour"],
+            "--brightness",
+            str(self.light_brightness.value()),
+        ]
+
+    def apply_lighting(self) -> None:
+        mode = self.light_mode_box.currentData()
+        channel = self.light_channel_box.currentData()
+        self._stop_light_process()
+        command = self._light_command(mode)
+
+        if mode not in lighting.STREAMED_MODES:
+            self.light_state.setText("")
+            self.dispatch(f"Lighting {mode}", command, timeout=30.0)
+            return
+
+        # Animated modes never exit on their own, so they cannot go through
+        # dispatch() -- that waits for completion and would hang the pool.
+        proc = QProcess(self)
+        proc.finished.connect(lambda *_: self._on_light_process_finished(mode))
+        proc.start(command[0], command[1:])
+        if not proc.waitForStarted(3000):
+            self.light_state.setText(f"Could not start {mode}.")
+            self.status.showMessage(f"Lighting {mode} — FAILED to start", 9000)
+            return
+        self.light_proc = proc
+        label = lighting.CHANNEL_LABELS[channel]
+        self.light_state.setText(
+            f"Running {LIGHT_MODE_LABELS[mode].lower()} on the {label}. "
+            "Animated modes are computed here and stop when Coldloop closes."
+        )
+        self.status.showMessage(f"Lighting {mode} — running", 4000)
+
+    def _on_light_process_finished(self, mode: str) -> None:
+        # Only report an unexpected exit; a stop we asked for already cleared
+        # the handle, and saying "stopped" twice is noise.
+        if self.light_proc is not None:
+            self.light_proc = None
+            self.light_state.setText(f"{LIGHT_MODE_LABELS[mode]} stopped unexpectedly.")
+
+    def lighting_off(self) -> None:
+        self._stop_light_process()
+        self.light_state.setText("")
+        self.dispatch("Lighting off", self._light_command("off"), timeout=30.0)
+
+    def closeEvent(self, event) -> None:
+        # Without this an animated mode would outlive the window, leaving an
+        # orphan process holding the cooler with no way to stop it from the UI.
+        self._stop_light_process()
+        super().closeEvent(event)
 
     # -- script editor ---------------------------------------------------
 

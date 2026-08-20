@@ -174,8 +174,9 @@ rather than regenerated, since those values were hand-tuned.
 
 ## Lighting
 
-`coldloop_lighting.py` drives the cooler's own LEDs: the pump ring around the
-LCD, and the RGB header the radiator fans chain into.
+Coldloop's **Lighting** tab drives the cooler's own LEDs: the pump ring around
+the LCD, and the RGB header the radiator fans chain into. Pick what to light,
+a mode, a colour and a brightness, then Apply. The same thing from the CLI:
 
 ```
 python coldloop_lighting.py --channel ring     --mode static --colour '#22d3ee'
@@ -193,6 +194,12 @@ python coldloop_lighting.py --show
 
 Modes are `static`, `off`, `breathing`, `pulse`, `spectrum` and `reactive`.
 Settings live in `~/.config/coldloop/lighting.json`.
+
+The animated modes never exit on their own, so the GUI runs them as a child
+process rather than through `dispatch()`, which waits for completion and would
+hang its thread pool. Switching mode, turning the lighting off, or closing the
+window all stop that process — otherwise it would outlive the window and hold
+the cooler with no way to stop it from the UI.
 
 This is the one part of the suite that does **not** shell out to `liquidctl`,
 because the CLI refuses these commands — liquidctl 1.16.0 maps this cooler's

@@ -1,7 +1,15 @@
 [Unit]
 Description=Coldloop HUD for NZXT Kraken Elite (liquidctl)
 Documentation=file:///home/theo/liquidctl-env/VERIFIED_COMMANDS.md
-After=graphical-session.target
+
+# Starts at boot, not at login. That needs two things together, and neither
+# works alone: `loginctl enable-linger theo`, so this user's systemd instance
+# is started at boot instead of at first login, and WantedBy=default.target
+# below, because graphical-session.target does not exist until someone logs in.
+#
+# Consequence worth knowing: this no longer stops at logout. The cooling
+# baseline in ExecStartPre therefore applies from boot, which is the safer
+# direction -- the fans are set before anyone logs in rather than after.
 
 # A crash loop here previously combined with an unsafe hardware command to make
 # the machine unusable across reboots. These caps mean systemd gives up instead
@@ -12,6 +20,18 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+
+# Boot races USB enumeration in a way login never did: at login the cooler has
+# been on the bus for a long time, but at boot this unit can start before the
+# device exists. Without this wait the first liquidctl call fails, and with
+# Restart=on-failure the unit can burn its whole 5-start budget in under a
+# minute and give up for good, needing a manual `reset-failed`. Waiting is
+# bounded, and failing after 45s is a real failure worth reporting.
+ExecStartPre=/bin/sh -c 'for i in $(seq 45); do /home/theo/liquidctl-env/venv/bin/liquidctl list 2>/dev/null | grep -q Kraken && exit 0; sleep 1; done; echo "Kraken did not appear on the USB bus within 45s" >&2; exit 1'
+
+# Give the waits above room; the default 90s start timeout is not enough once
+# a 45s device wait is followed by three liquidctl calls.
+TimeoutStartSec=180
 
 # Initialize the device, then apply a cooling baseline.
 #
@@ -37,4 +57,4 @@ Restart=on-failure
 RestartSec=10
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

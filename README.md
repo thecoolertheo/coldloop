@@ -35,7 +35,7 @@ python kraken_hud.py --check-contrast                # WCAG check on text colour
 
 The service is `Restart=on-failure` (not `always`) and rate-limited to 5 starts
 per 5 minutes, so a failing HUD gives up rather than reapplying a bad state
-forever. It is wanted by `graphical-session.target`, so it stops at logout.
+forever. It starts at boot and does **not** stop at logout.
 
 If the device goes unreachable for an extended stretch (observed once as the
 Kraken's HID endpoint dropping out with `ValueError: The device has no
@@ -61,7 +61,44 @@ If the graphical session itself will not come up, Bazzite's GRUB emergency mode
 password; from there:
 
 ```
-rm /home/theo/.config/systemd/user/graphical-session.target.wants/liquidctl.service
+rm /home/theo/.config/systemd/user/default.target.wants/liquidctl.service
+rm /home/theo/.config/systemd/user/default.target.wants/coldloop-lighting.service
+rm /var/lib/systemd/linger/theo      # stop the services starting at boot at all
+```
+
+Note the path is `default.target.wants`, not `graphical-session.target.wants`:
+these services start at boot rather than at login (see below). Removing the
+linger marker is the bigger hammer — it stops this user's systemd instance from
+starting at boot, so nothing here runs until you log in.
+
+## Starting at boot instead of at login
+
+Both services come up at boot, before anyone logs in, and keep running across
+logout. That needs two things, and neither works on its own:
+
+```
+loginctl enable-linger theo     # start this user's systemd instance at boot
+```
+
+plus `WantedBy=default.target` in both units. `graphical-session.target` — what
+they used to hang off — does not exist until someone logs in, so it can never
+start anything at boot.
+
+The upside beyond convenience is that the cooling baseline in
+`liquidctl.service`'s `ExecStartPre` is applied from boot rather than from
+first login.
+
+Booting introduces a race that logging in did not: the unit can start before
+the cooler has been enumerated on the USB bus. Both units therefore wait up to
+45 seconds for it to appear. Without that wait the first liquidctl call fails
+immediately, and with `Restart=on-failure` the unit can burn its whole
+5-starts-per-300s budget in under a minute and give up permanently, needing a
+manual `systemctl --user reset-failed`.
+
+To go back to starting at login:
+
+```
+loginctl disable-linger theo
 ```
 
 ## Switching faces

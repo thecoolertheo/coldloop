@@ -1,7 +1,15 @@
 [Unit]
 Description=Coldloop lighting for NZXT Kraken Elite (pump ring and fan chain)
 Documentation=file:///home/theo/liquidctl-env/VERIFIED_COMMANDS.md
-After=graphical-session.target
+
+# Starts at boot rather than at login; see liquidctl.service for the two halves
+# that make that work (`loginctl enable-linger` plus WantedBy=default.target).
+
+# Ordered after the HUD, which runs `liquidctl initialize all`. That is not a
+# hard dependency -- lighting is perfectly useful with the HUD stopped, so
+# After= without Requires= -- but when both start together it avoids writing
+# LED colours into the middle of the device being initialized.
+After=liquidctl.service
 
 # Same reasoning as liquidctl.service: cap restarts so a failing holder gives up
 # instead of respawning forever. These must live in [Unit]; systemd ignores them
@@ -11,6 +19,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+
+# Same boot-versus-login race as the HUD: wait for the cooler to appear rather
+# than failing instantly and burning the restart budget before login.
+ExecStartPre=/bin/sh -c 'for i in $(seq 45); do /home/theo/liquidctl-env/venv/bin/liquidctl list 2>/dev/null | grep -q Kraken && exit 0; sleep 1; done; echo "Kraken did not appear on the USB bus within 45s" >&2; exit 1'
+TimeoutStartSec=120
 
 # Why this is a long-running service and not a one-shot command:
 #
@@ -37,4 +50,4 @@ Restart=on-failure
 RestartSec=10
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

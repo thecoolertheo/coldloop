@@ -64,7 +64,7 @@ lighting settings in `~/.config/coldloop/` are left alone.
 | `coldloop-lighting.service.in` | unit template that holds the LED colour (the firmware forgets it) |
 | `install.sh` | Installs/uninstalls the venv, units, desktop entry and icon |
 | `tests/` | Fan-safety guards; `python -m unittest discover -s tests` |
-| `coldloop_lcd.py` | Fast in-process LCD writer (~150ms a frame instead of ~560ms) |
+| `coldloop_lcd.py` | In-process LCD writer (~370ms a frame instead of ~560ms) |
 | `compat/smbus.py` | Pure-python stand-in for the C extension liquidctl declares |
 | `VERIFIED_COMMANDS.md` | Ground-truth liquidctl syntax and duty limits for this device |
 
@@ -171,32 +171,23 @@ python kraken_hud.py --set-face bars     # the running HUD crossfades to it
 The service notices that file while idle (not just at the top of its 2s
 interval) and applies the new face in about 0.4s.
 
-**A crossfade is available, and the old rule against it was half wrong.** This
-README used to say the panel accepts about 1.8 frames per second, because a
-`set lcd screen static` push measured a consistent 0.56s. The measurement was
-right; the conclusion was not. Only ~155ms of that 0.56s was the device. The
-rest was per-frame work that never changes between frames -- a liquidctl
-subprocess, a PNG written and re-decoded, 1.6 million Python appends to build
-the pixel buffer, and 16 HID round trips to find a free bucket. See
-[LCD frame rate](#lcd-frame-rate).
-
-With that hoisted out, a frame costs ~150ms and a dissolve runs at six or seven
-frames a second. The original objection still describes what a *slow* crossfade
-looks like: a slideshow of half-transparent double-exposures with both faces
-legible at once. Intermediate blend frames are only meaningful as part of a
-smooth sequence, where a wipe's are legible on their own. What changed is the
-sequence is now smooth enough. `wipe` stays the default anyway -- it is cheaper,
-and it is the one that still looks deliberate if the fast writer is ever
-unavailable.
+**A crossfade is available, opt-in, and worth judging by eye.** This README
+used to forbid crossfades outright: at ~0.56s a frame, a four-step blend held
+each half-transparent double-exposure on screen long enough that both faces
+were legible at once, and it read as a rendering fault rather than a dissolve.
+Frames now cost ~370ms (see [LCD frame rate](#lcd-frame-rate)), which is
+faster but not dramatically so -- a three-step fade is still close to that
+original experiment. So `wipe` stays the default: each of its frames is a
+hard-edged state that looks deliberate on its own, at any frame rate.
 
 Set from the Face switching dropdown on the Gallery tab, or `--transition`:
 
 | Mode | Cost | Behaviour |
 | --- | --- | --- |
-| `wipe` (default) | 3 pushes, ~0.45s | radial sweep from 12 o'clock, new face revealed behind a hard edge |
-| `crossfade` | 6 pushes, ~0.9s | the old face dissolves into the new one |
-| `instant` | 1 push, ~0.15s | old face holds until the new one lands; no black frame |
-| `loading` | 2 pushes, ~0.3s | shows the loading frame first, announcing the change |
+| `wipe` (default) | 3 pushes, ~1.1s | radial sweep from 12 o'clock, new face revealed behind a hard edge |
+| `crossfade` | 3 pushes, ~1.1s | the old face dissolves into the new one |
+| `instant` | 1 push, ~0.37s | old face holds until the new one lands; no black frame |
+| `loading` | 2 pushes, ~0.75s | shows the loading frame first, announcing the change |
 
 Costs assume the fast writer; on the liquidctl fallback each push is ~0.56s
 instead, and `crossfade` collapses to a cut rather than dragging out.
@@ -387,55 +378,66 @@ exactly the change worth catching.
 
 ## LCD frame rate
 
-A frame costs about **150ms**, so the HUD runs at roughly **6.6 fps**. It used
-to be 0.56s and ~1.8 fps, and the difference is not the device.
+A frame costs about **370ms**, so the HUD runs at roughly **2.7 fps** -- up
+from 0.56s and ~1.8 fps. Measured on the real cooler and confirmed by eye with
+a test card: 165 frames in 60 seconds.
 
-Measured per step on the real cooler, the old 0.56s push was:
+About 200ms of the old 0.56s was host-side work identical between frames:
 
 | | |
 | --- | --- |
-| bulk transfer of the frame | ~155 ms |
+| liquidctl subprocess start | ~90 ms |
 | `_prepare_static_file` | ~52 ms (1.6M Python appends, every frame) |
 | `_query_buckets`, 16 HID round trips | ~32 ms |
-| orientation + brightness read | ~19 ms |
-| bucket allocate/free churn | ~20 ms |
-| liquidctl subprocess start | ~90 ms |
 | PNG encode, write, re-decode | ~30 ms |
+| orientation + brightness read | ~19 ms |
 
-Only the first line is the panel. Everything else is identical between frames,
-so `coldloop_lcd.py` does it once: the device is held open, orientation is read
+`coldloop_lcd.py` does that once: the device is held open, orientation is read
 at connect, two buckets are claimed and alternated, and frames are converted
-with numpy and handed to pyusb as `bytes` rather than a 1.6-million-element
-list. The numpy conversion is verified byte-identical to the driver's own
-output, so this is the same bytes on the wire.
+with numpy (verified byte-identical to the driver's own output) and handed to
+pyusb as `bytes`. What remains, ~350ms, is the cooler ingesting 1600 KB into a
+freshly prepared bucket. Sending fewer bytes is the only obvious way past it:
+the driver has an RGB565 path at half the size, but it belongs to a different
+Kraken model and is unverified here.
 
-**What is left is the device.** 1600 KB per frame at the ~10.3 MB/s it
-sustains is ~155ms, and that figure is flat across USB chunk sizes from 64 KB
-to 2 MB -- which is how we know it is the cooler accepting data and not host
-overhead. Sending fewer bytes is the only way past it: the driver has an RGB565
-path at half the size, but it belongs to a different Kraken model and is
-unverified here.
+**This section once claimed 6.6 fps, and that was wrong.** The first version of
+the fast writer re-used buckets without deleting them; the device rejects setup
+on an occupied bucket, the rejection was ignored, and frames were streamed into
+a bucket that had refused them. The panel showed ghosted, monochrome copies of
+the HUD and blinked to black every few seconds -- and a rejected bucket also
+ingests data much faster than a real one, so the corruption and the impressive
+number had the same cause. Every byte-level check passed; looking at the panel
+is what caught it. The details are in `coldloop_lcd.py` and
+`VERIFIED_COMMANDS.md`.
 
 Set `KRAKEN_FAST_LCD=0` to force the old liquidctl path, which is the quickest
-way to tell whether a display problem is the fast writer's fault.
+way to tell whether a display problem is the fast writer's fault. To make it
+stick across restarts, put it in a systemd drop-in:
 
-Alternating two fixed buckets should also have designed out the "HUD randomly
-goes black for a second" bug: that came from the driver cycling all 16 buckets
-and wrapping, which surfaces as `AssertionError('reached max bucket')` and a
-black panel until the next push.
+```
+mkdir -p ~/.config/systemd/user/liquidctl.service.d
+printf '[Service]\nEnvironment=KRAKEN_FAST_LCD=0\n' \
+  > ~/.config/systemd/user/liquidctl.service.d/disable-fast-lcd.conf
+systemctl --user daemon-reload && systemctl --user restart liquidctl.service
+```
+
+Alternating two fixed buckets should also design out the "HUD randomly goes
+black for a second" bug, which came from the driver cycling all 16 buckets and
+wrapping (`AssertionError('reached max bucket')`). Expected, not yet observed
+over a long run.
 
 ### Animation
 
-Two things spend the extra frames:
+At ~370ms a frame there is room for short, stepped motion, not smooth motion:
 
-* **Readings ease to new values** instead of snapping -- gauges sweep, numbers
-  climb. Only when a reading moves by more than its noise floor (0.3 °C of
-  coolant, 8 points of CPU load, 80 rpm), so an idle machine still costs one
-  frame every couple of seconds rather than animating constantly.
+* **Readings ease to new values** over about a second (three frames) instead
+  of snapping, but only when a reading moves by more than its noise floor
+  (0.3 °C of coolant, 8 points of CPU load, 80 rpm), so an idle machine still
+  costs one frame per interval rather than animating constantly.
 * **`crossfade`** is available as a face transition, above.
 
-Both are skipped automatically when the fast writer is unavailable, since half
-a second of easing becomes nearly two seconds of lag at 0.56s a frame.
+Both are skipped when the fast writer is unavailable, since three frames at
+0.56s each would read as lag rather than motion.
 
 ## Fan safety
 

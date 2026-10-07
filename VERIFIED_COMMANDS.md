@@ -69,44 +69,61 @@ so the HUD does not need to pre-rotate its own frames.
 
 Measured on the real cooler on 2026-10-06, with the HUD service stopped.
 
-A `set lcd screen static` push through the CLI takes **566 ms**. Held open
-in-process it is **476 ms**. Broken down per step:
+A `set lcd screen static` push through the CLI takes **566 ms**. About 200 ms
+of that is host-side and identical between frames:
 
 | step | ms |
 | --- | --- |
-| bulk transfer of the frame | ~155 |
-| `_prepare_static_file` | ~52 |
-| `_query_buckets` (16 HID round trips) | ~32 |
-| orientation + brightness read (`[0x30, 0x01]`) | ~19 |
-| bucket allocate/free churn | ~20 |
 | liquidctl subprocess start | ~90 |
+| `_prepare_static_file` (1.6M Python appends) | ~52 |
+| `_query_buckets` (16 HID round trips) | ~32 |
 | PNG encode, write, re-decode | ~30 |
+| orientation + brightness read (`[0x30, 0x01]`) | ~19 |
 
-`coldloop_lcd.py` keeps only the first line, reaching **6.7 fps sustained**
-(median 152 ms/frame, measured over 134 frames of a real animation).
+`coldloop_lcd.py` removes those, leaving the device ingesting 1600 KB into a
+freshly prepared bucket: ~350 ms. **2.7 fps sustained**, 165 frames in 60 s,
+confirmed by eye with a four-colour test card.
 
-Three facts worth not relearning:
+### ⚠️ Setup on an occupied bucket is rejected
 
-1. **The device sustains ~10.3 MB/s.** A 640x640 frame is 1600 KB at 4 bytes
-   per pixel, so ~155 ms is the floor. Verified device-bound, not host-bound,
-   by varying the USB chunk size from 64 KB to 2 MB: throughput is flat.
-2. **`_prepare_static_file` appends four values per pixel in Python** --
-   1,638,400 appends per frame. The numpy equivalent is ~2.5 ms and was
-   verified byte-identical on a real frame. Do not "simplify" it back.
-3. **`_send_data` wraps every chunk in `list()`** before handing it to pyusb,
-   rebuilding the whole payload as a Python list. Passing `bytes` straight
-   through is ~1.2x on the transfer alone.
+`_setup_bucket` on a bucket that still holds data returns a rejection
+(`reply[14] != 0x01`). Reproduced directly: skip the delete and the first
+setup fails. The driver avoids this by always deleting first -- twice when the
+bucket was occupied (`_prepare_bucket`).
 
-Bucket handling matters beyond speed. The driver allocates a fresh bucket per
-push, cycles all 16 and wraps, which is the documented cause of
-`AssertionError('reached max bucket')` and the HUD's "randomly goes black"
-reports. Alternating two fixed buckets never wraps.
+The first version of the fast writer skipped the delete and ignored the result,
+and streamed frames into rejected buckets. On the panel: **ghosted, monochrome
+copies of the HUD, blinking to black every few seconds.** It also measured a
+convincing 6.7 fps, because a rejected bucket ingests data much faster than a
+real one. Both were artifacts of the same mistake, and every byte-level check
+passed -- the numpy payload really was byte-identical to the driver's. Only
+looking at the panel caught it. Any change to the push path must be verified
+by eye, not by return codes.
 
-Holding the device open claims the USB **bulk** interface. Verified that this
-does not disturb the HID commands everything else uses: `status`,
-`set pump speed`, `set fan speed` and `set lcd screen brightness` all still
-succeed while the HUD holds the device. Only image pushes use bulk, and only
-the HUD pushes images.
+### ⚠️ `_write_then_read` does not match replies
+
+It writes, then returns whichever report arrives next. `_send_data` ends a
+transfer with a plain `_write([0x36, 0x02])` that never reads its reply, so the
+following `_switch_bucket` reads that stale reply instead of its own. That is
+why the driver logs "Failed to switch active bucket" on almost every push while
+frames display fine.
+
+Replies echo the command with the first byte incremented (`0x36 0x02` ->
+`0x37 0x02`, `0x38 0x01` -> `0x39 0x01`, `0x32 0x01` -> `0x33 0x01`), status in
+byte 14. `coldloop_lcd.py` matches on that prefix and clears the queue at the
+start of each push; with that, every command in a push gets its own reply and
+reports success.
+
+### Other facts
+
+* `_prepare_static_file` appends four values per pixel in Python. The numpy
+  equivalent is ~2.5 ms and byte-identical. Do not "simplify" it back.
+* Holding the device open claims the USB bulk interface. HID commands
+  (`status`, `set pump speed`, `set fan speed`, `set lcd screen brightness`)
+  still succeed while the HUD holds it. Only image pushes use bulk.
+* An earlier claim that the device sustains ~10.3 MB/s, "verified device-bound
+  by varying USB chunk size", was measured on the rejected-bucket path and is
+  void.
 
 ## Lighting: the pump ring and the RGB fan chain
 

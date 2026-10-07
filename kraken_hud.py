@@ -57,7 +57,7 @@ SUPPORTED_VENDOR_ID = 0x1E71
 SUPPORTED_PRODUCT_ID = 0x3012
 SUPPORTED_NAME = "NZXT Kraken 2024 Elite RGB (1e71:3012)"
 
-# The in-process LCD writer, which takes a frame from ~560ms to ~150ms. Guarded
+# The in-process LCD writer, which takes a frame from ~560ms to ~370ms. Guarded
 # because it needs numpy and liquidctl's internals: if it cannot be imported the
 # HUD must still run on the liquidctl CLI, just at the old rate.
 try:
@@ -70,9 +70,12 @@ except Exception as _exc:  # pragma: no cover - environment problem
 # the fast writer can be ruled out without editing code or reverting.
 FAST_LCD_ENABLED = FastLcd is not None and os.environ.get("KRAKEN_FAST_LCD", "1") != "0"
 
-# Measured on the real cooler: 1600 KB per frame at the ~10.3 MB/s the device
-# sustains. Used for pacing animations, not as a hard limit.
-FAST_LCD_FPS = 6.6
+# Measured on the real cooler, visually confirmed: 165 frames in 60s with the
+# corrected bucket protocol. An earlier figure of 6.6 fps was measured while the
+# writer streamed into buckets the device had rejected, which is what produced
+# ghosted monochrome copies on the panel; it was never a real rate. Used for
+# pacing animations, not as a hard limit.
+FAST_LCD_FPS = 2.7
 FAST_LCD_FRAME_TIME = 1.0 / FAST_LCD_FPS
 
 SIZE = 640
@@ -1534,11 +1537,14 @@ DEFAULT_TRANSITION = "wipe"
 # ~1.8 fps a four-step blend held each half-transparent double-exposure on
 # screen for over half a second, so both faces were legible at once and it read
 # as a rendering fault rather than a dissolve. The in-process writer puts a
-# frame at ~150ms, so the same dissolve now runs at six or seven frames a
-# second and each intermediate is gone before the eye resolves it as a separate
-# image. The wipe remains the default: it is cheaper, and it is the one that
-# still works if the fast writer is ever unavailable.
-CROSSFADE_SECONDS = 0.9
+# frame at ~370ms rather than ~560ms. That is a real improvement but a modest
+# one: each intermediate is still on screen long enough to be seen as its own
+# image, so whether this reads as a dissolve or as the old double-exposure is a
+# judgement to make by eye. The wipe remains the default.
+# Three steps at the measured ~370ms a frame. This is close to the four-step
+# fade that originally looked broken, just faster, so it stays opt-in; judge it
+# by eye before making it anyone's default.
+CROSSFADE_SECONDS = 1.1
 
 # Intermediate frames in a wipe, excluding the final full frame. Two puts the
 # boundary at 1/3 and 2/3 of the sweep; each costs 0.56s, so this is the knob
@@ -1574,7 +1580,10 @@ def wipe(writer: "LcdWriter", old: Image.Image, new: Image.Image) -> bool:
 # or two between every reading, and easing that would mean the HUD was always
 # animating -- an expensive way to be busy. These sit above the noise for each
 # reading, so movement on screen means something actually moved.
-EASE_SECONDS = 0.5
+# Long enough for two intermediate frames at ~370ms each. Any shorter and the
+# step count rounds down to a plain cut, which is the honest outcome but not an
+# animation.
+EASE_SECONDS = 1.0
 EASE_THRESHOLDS = {
     "coolant": 0.3,      # °C; finer than this is sensor noise
     "cpu_load": 8.0,     # percent
@@ -1987,11 +1996,11 @@ class LcdWriter:
 
     @property
     def is_fast(self) -> bool:
-        """Whether frames are currently going out at ~150ms rather than ~560ms.
+        """Whether frames are currently going out at ~370ms rather than ~560ms.
 
-        Animations are gated on this. Easing a reading over half a second means
-        three frames on the fast path and the better part of two seconds on the
-        slow one, where it would read as lag rather than motion.
+        Animations are gated on this. An ease is three frames: about a second
+        on the fast path, but nearly two on the slow one, where it would read
+        as lag rather than motion.
         """
         return self._fast is not None
 

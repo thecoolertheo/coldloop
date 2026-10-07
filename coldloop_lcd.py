@@ -1,45 +1,53 @@
 #!/usr/bin/env python3
-"""Fast LCD writer: ~6.6 fps instead of ~1.8.
+"""Fast LCD writer: ~2.7 fps instead of ~1.8.
 
-WHY THE OLD CEILING WAS NOT THE DEVICE
---------------------------------------
-Every frame used to cost a consistent 0.56s, and the whole HUD was designed
-around the ~1.8 fps that implies -- including the README's standing rule
-against crossfades. That number was real but it was never the panel's limit.
-Measured on the real cooler, a 0.56s push breaks down as:
+WHAT IS AND IS NOT THE DEVICE
+-----------------------------
+A liquidctl `set lcd screen static` push costs a consistent 0.56s. About 200ms
+of that is host-side work that is identical between frames:
 
-    bulk transfer of the frame          ~155 ms
-    `_prepare_static_file`               ~52 ms   1.6M Python appends
-    `_query_buckets`, 16 HID round trips  ~32 ms
-    orientation/brightness read           ~19 ms
-    bucket alloc/free churn               ~20 ms
     liquidctl subprocess start            ~90 ms
+    `_prepare_static_file`                ~52 ms   1.6M Python appends
+    `_query_buckets`, 16 HID round trips  ~32 ms
     PNG encode, write, re-decode          ~30 ms
+    orientation/brightness read           ~19 ms
 
-Only the first line is the device. Everything else is per-frame work that never
-changes between frames, so this module does it once:
+This module does that once instead of per frame: the device is held open,
+orientation is read at connect, two buckets are claimed and alternated, and
+frames are converted with numpy (2.5 ms, byte-identical to the driver's loop)
+and sent as `bytes`.
 
-* The device is held open, so no subprocess and no USB re-open per frame.
-* Orientation is read once at connect, not before every push.
-* Two buckets are claimed once and alternated, so there is no per-frame
-  allocation, no 16-query scan, and -- importantly -- no wrap-around.
-* Frames are converted with numpy (2.5 ms, byte-identical to the driver's
-  loop) and sent as `bytes`, so pyusb is handed a buffer rather than a
-  1.6-million-element list.
+What remains is the device ingesting the frame into a freshly prepared bucket:
+~350 ms for 1600 KB. Measured result, visually confirmed on the panel with a
+test card: 165 frames in 60s, 2.7 fps.
 
-Measured result: 6.6 fps sustained, median 152 ms/frame, and flat across USB
-chunk sizes from 64 KB to 2 MB -- which is how we know the remaining time is
-the device accepting ~10.3 MB/s, not host overhead. A 640x640 frame is 1600 KB
-at 4 bytes per pixel, so 1600/10.3 ~= 155 ms is the floor for a full-colour
-frame. Sending fewer bytes is the only way past it.
+THE BUG THE FIRST VERSION SHIPPED WITH
+--------------------------------------
+The first version skipped deleting a bucket before re-using it, called setup on
+the occupied bucket, and ignored the result. The device rejects setup on an
+occupied bucket -- reproduced directly: remove the deletes and setup returns a
+rejection on the first frame. So that version streamed every frame into a
+bucket that had refused it, and the panel showed ghosted, monochrome copies of
+the HUD with a black blink every few seconds. It also *measured* 6.6 fps,
+because a rejected bucket ingests data far faster than a real one. Both the
+corruption and the speed were artifacts of the same mistake, and it was only
+caught by looking at the panel: every byte-level check had passed.
 
-A SIDE EFFECT WORTH KEEPING
----------------------------
-The HUD's long-standing "randomly goes black for a second" bug came from the
-driver cycling all 16 buckets and wrapping, which surfaces as
-`AssertionError('reached max bucket')` and a black panel until the next push.
-Alternating two fixed buckets never wraps, so that failure mode is designed
-out rather than retried around.
+Two rules follow, and `push_payload` enforces both:
+
+* Delete a bucket (twice, as the driver does for an occupied one) before
+  setting it up, and treat a rejected setup or switch as a failure.
+* Match every HID reply to its own command. The driver's `_write_then_read`
+  returns whichever report arrives next, and its `_send_data` never reads the
+  reply to `[0x36, 0x02]`, so the bucket switch after it reads a stale reply.
+  That is why the driver logs "Failed to switch active bucket" on nearly every
+  push while frames display fine -- and why checking results without matching
+  replies would have produced false failures here too.
+
+Alternating two fixed buckets should also design out the HUD's old "randomly
+goes black for a second" bug, which came from the driver cycling all 16 buckets
+and wrapping (`AssertionError('reached max bucket')`). That one is expected,
+not yet observed over a long run.
 """
 
 from __future__ import annotations
@@ -83,6 +91,10 @@ _BUCKETS = (0, 1)
 
 # Opcode for a static RGBX image, as used by the driver's own static path.
 _STATIC = 0x02
+
+# Reports to read past while waiting for a specific reply. Matches the driver's
+# own _MAX_READ_ATTEMPTS; each read has its own timeout.
+_MAX_REPLY_READS = 12
 
 
 @contextlib.contextmanager
@@ -201,14 +213,47 @@ class FastLcd:
         blocks = math.ceil((len(_MAGIC) + 8 + payload) / 1024)
         self._blocks = list(blocks.to_bytes(2, "little"))
 
-        self.device._write_then_read([0x36, 0x03])
+        self.device.device.clear_enqueued_reports()
+        self._command([0x36, 0x03])
         self.device._delete_all_buckets()
         self._offsets = {}
         for n, index in enumerate(_BUCKETS):
             offset = list((n * blocks).to_bytes(2, "little"))
             self._offsets[index] = offset
-            if not self.device._setup_bucket(index, index + 1, offset, self._blocks):
+            if not self._setup(index):
                 raise RuntimeError(f"could not set up bucket {index}")
+
+    # -- protocol --------------------------------------------------------
+
+    def _command(self, data: list[int]) -> bytes:
+        """Send a HID command and return *its* reply, not just the next one.
+
+        The driver's `_write_then_read` returns whatever report arrives next,
+        and its `_send_data` ends a transfer with a plain `_write([0x36, 0x02])`
+        that never reads its reply. That reply then sits in the queue, so the
+        bucket switch that follows reads it instead of its own -- which is why
+        the driver logs "Failed to switch active bucket" on nearly every push
+        while frames display fine. Checking those results is only meaningful
+        if each reply is matched to its command.
+
+        Replies echo the command with the first byte incremented
+        (0x30 0x01 -> 0x31 0x01, 0x32 0x02 -> 0x33 0x02), so read until that
+        prefix arrives and discard anything stale on the way. Reads time out,
+        so a reply that never comes raises rather than hangs.
+        """
+        expected = bytes([data[0] + 1, data[1]])
+        self.device._write(data)
+        for _ in range(_MAX_REPLY_READS):
+            msg = self.device._read()
+            if bytes(msg[0:2]) == expected:
+                return msg
+        raise RuntimeError(f"no reply to command {data[0]:#04x} {data[1]:#04x}")
+
+    def _setup(self, index: int) -> bool:
+        offset = self._offsets[index]
+        reply = self._command([0x32, 0x01, index, index + 1,
+                               offset[0], offset[1], self._blocks[0], self._blocks[1], 0x01])
+        return reply[14] == 0x01
 
     # -- pushing ---------------------------------------------------------
 
@@ -220,15 +265,39 @@ class FastLcd:
 
         bulk_info = [_STATIC, 0x0, 0x0, 0x0] + list(len(payload).to_bytes(4, "little"))
 
-        # Re-asserting the bucket each frame costs ~0.3 ms and keeps the device
-        # from drifting if something else touched it between frames.
-        device._setup_bucket(index, index + 1, self._offsets[index], self._blocks)
-        device._write_then_read([0x36, 0x01, index])
+        # Mirror the driver's per-push preamble. Its purpose is undocumented
+        # ("unknown" in the driver), it costs one HID round trip, and the
+        # first version of this writer skipping it is one of two differences
+        # from the driver in place when frames came out corrupted.
+        # Start from an empty queue so nothing stale from a previous frame, or
+        # from another process's HID command, can be mistaken for a reply.
+        device.device.clear_enqueued_reports()
+        self._command([0x36, 0x03])
+
+        # Never write into a bucket that still holds data. The driver always
+        # deletes first, and deletes *twice* when the bucket was occupied
+        # (`_prepare_bucket`). The first version of this writer re-ran setup on
+        # the occupied bucket and ignored the result; on the real panel that
+        # produced several ghosted, monochrome copies of the HUD and a black
+        # blink every few seconds -- consistent with the device appending each
+        # frame to the existing asset and playing them back as a sequence.
+        for _ in range(2):
+            device._delete_bucket(index)
+        if not self._setup(index):
+            # Raising sends push() down its reconnect path and the HUD falls
+            # back to liquidctl for this frame. A rejected setup must never be
+            # followed by a transfer, which is what silently corrupted frames.
+            raise RuntimeError(f"bucket {index} setup rejected")
+
+        self._command([0x36, 0x01, index])
         device._bulk_write(bytes(_MAGIC + bulk_info))
         for start in range(0, len(payload), device.bulk_buffer_size):
             device._bulk_write(payload[start : start + device.bulk_buffer_size])
-        device._write([0x36, 0x02])
-        device._switch_bucket(index)
+        # Unlike the driver, read this reply: leaving it queued is what made
+        # every switch below look like a failure.
+        self._command([0x36, 0x02])
+        if self._command([0x38, 0x01, 0x04, index])[14] != 0x01:
+            raise RuntimeError(f"switch to bucket {index} rejected")
 
     def push(self, image: Image.Image) -> bool:
         """Convert and send one frame, taking the shared lock."""
@@ -277,15 +346,25 @@ def demo(seconds: float = 12.0, fps: float = 6.5) -> int:
     count = max(8, int(round(fps * 2)))
     print(f"pre-rendering {count} frames…")
     payloads = []
+    # A test card rather than something pretty, because it has to make the
+    # failure modes impossible to miss: four saturated quadrants show a colour
+    # or monochrome fault at a glance, and a single hand shows ghosting as
+    # multiple hands. The first version of this writer passed every byte-level
+    # check and still put garbage on the panel; only looking caught it.
+    import math as _math
+    half = SIZE // 2
     for i in range(count):
-        frame = Image.new("RGB", (SIZE, SIZE), "#05231f")
+        frame = Image.new("RGB", (SIZE, SIZE), "#000000")
         draw = ImageDraw.Draw(frame)
-        angle = 360.0 * i / count
-        draw.pieslice([30, 30, SIZE - 30, SIZE - 30], angle - 90, angle - 18, fill="#2dd4bf")
-        draw.ellipse([150, 150, SIZE - 150, SIZE - 150], fill="#05231f")
-        draw.pieslice([190, 190, SIZE - 190, SIZE - 190], -angle * 2 - 90,
-                      -angle * 2 - 40, fill="#7dd3fc")
-        draw.ellipse([250, 250, SIZE - 250, SIZE - 250], fill="#05231f")
+        draw.rectangle([0, 0, half, half], fill="#ff0000")
+        draw.rectangle([half, 0, SIZE, half], fill="#00ff00")
+        draw.rectangle([0, half, half, SIZE], fill="#0000ff")
+        draw.rectangle([half, half, SIZE, SIZE], fill="#ffff00")
+        draw.ellipse([120, 120, SIZE - 120, SIZE - 120], fill="#000000")
+        angle = 2 * _math.pi * i / count - _math.pi / 2
+        tip = (half + 190 * _math.cos(angle), half + 190 * _math.sin(angle))
+        draw.line([(half, half), tip], fill="#ffffff", width=14)
+        draw.ellipse([half - 18, half - 18, half + 18, half + 18], fill="#ffffff")
         payloads.append(to_payload(frame, lcd.orientation))
 
     print(f"animating for {seconds:.0f}s — watch the cooler")

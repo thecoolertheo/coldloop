@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +56,24 @@ MATCH = "Kraken"
 SUPPORTED_VENDOR_ID = 0x1E71
 SUPPORTED_PRODUCT_ID = 0x3012
 SUPPORTED_NAME = "NZXT Kraken 2024 Elite RGB (1e71:3012)"
+
+# The in-process LCD writer, which takes a frame from ~560ms to ~150ms. Guarded
+# because it needs numpy and liquidctl's internals: if it cannot be imported the
+# HUD must still run on the liquidctl CLI, just at the old rate.
+try:
+    from coldloop_lcd import FastLcd
+except Exception as _exc:  # pragma: no cover - environment problem
+    FastLcd = None
+    print(f"[hud] fast LCD writer unavailable: {_exc}", file=sys.stderr)
+
+# KRAKEN_FAST_LCD=0 forces the old liquidctl path, so a suspected regression in
+# the fast writer can be ruled out without editing code or reverting.
+FAST_LCD_ENABLED = FastLcd is not None and os.environ.get("KRAKEN_FAST_LCD", "1") != "0"
+
+# Measured on the real cooler: 1600 KB per frame at the ~10.3 MB/s the device
+# sustains. Used for pacing animations, not as a hard limit.
+FAST_LCD_FPS = 6.6
+FAST_LCD_FRAME_TIME = 1.0 / FAST_LCD_FPS
 
 SIZE = 640
 CENTER = SIZE / 2.0
@@ -1507,8 +1525,20 @@ def render_loading(progress: float, message: str = "STARTING") -> Image.Image:
 # meaningful as part of a smooth sequence, which this device cannot deliver.
 # The sweep is radial because the panel is round and the faces are built from
 # arcs, so it echoes the geometry already on screen.
-TRANSITIONS = ("wipe", "instant", "loading")
+TRANSITIONS = ("wipe", "crossfade", "instant", "loading")
 DEFAULT_TRANSITION = "wipe"
+
+# A crossfade is viable again, and only because the frame rate changed.
+#
+# The comment above is still right about *why* the first attempt failed: at
+# ~1.8 fps a four-step blend held each half-transparent double-exposure on
+# screen for over half a second, so both faces were legible at once and it read
+# as a rendering fault rather than a dissolve. The in-process writer puts a
+# frame at ~150ms, so the same dissolve now runs at six or seven frames a
+# second and each intermediate is gone before the eye resolves it as a separate
+# image. The wipe remains the default: it is cheaper, and it is the one that
+# still works if the fast writer is ever unavailable.
+CROSSFADE_SECONDS = 0.9
 
 # Intermediate frames in a wipe, excluding the final full frame. Two puts the
 # boundary at 1/3 and 2/3 of the sweep; each costs 0.56s, so this is the knob
@@ -1534,6 +1564,110 @@ def wipe(writer: "LcdWriter", old: Image.Image, new: Image.Image) -> bool:
             return False  # the writer already logged and counted the failure
     # The sweep only ever shows partial frames, so the complete new face has
     # to be pushed to finish: WIPE_STEPS + 1 pushes in total.
+    return writer.push(new)
+
+
+# How long a reading takes to travel to its new value, and how big a change has
+# to be before it is worth animating at all.
+#
+# The thresholds are the whole point of "reactive": CPU load jitters by a point
+# or two between every reading, and easing that would mean the HUD was always
+# animating -- an expensive way to be busy. These sit above the noise for each
+# reading, so movement on screen means something actually moved.
+EASE_SECONDS = 0.5
+EASE_THRESHOLDS = {
+    "coolant": 0.3,      # °C; finer than this is sensor noise
+    "cpu_load": 8.0,     # percent
+    "gpu_load": 8.0,
+    "ram_percent": 4.0,
+    "cpu_temp": 2.5,     # °C
+    "gpu_temp": 2.5,
+    "ram_used_gb": 0.5,
+    "pump_rpm": 80,
+    "fan_rpm": 80,
+    "fps": 10.0,
+}
+
+# Rounded back to whole numbers after interpolation: these are displayed as
+# integers, and a readout flickering between 2519 and 2520 rpm mid-ease is
+# exactly the noise the animation would be drawing the eye to.
+EASE_INTEGER_FIELDS = frozenset({"pump_rpm", "fan_rpm"})
+
+
+def _lerp(start, end, t: float):
+    """Interpolate, treating a missing reading as "jump straight there".
+
+    A metric can be None (no GPU, no FPS provider) and can start or stop being
+    None between readings. Animating from None is meaningless, so those land on
+    the new value immediately.
+    """
+    if start is None or end is None:
+        return end
+    return start + (end - start) * t
+
+
+def ease_metrics(old: "Metrics", new: "Metrics", t: float) -> "Metrics":
+    """``new`` as it looks ``t`` of the way through the ease from ``old``."""
+    # Smoothstep rather than linear, so values arrive at rest instead of
+    # stopping dead at full speed.
+    eased = t * t * (3.0 - 2.0 * t)
+    changes = {}
+    for name in EASE_THRESHOLDS:
+        value = _lerp(getattr(old, name), getattr(new, name), eased)
+        if value is not None and name in EASE_INTEGER_FIELDS:
+            value = int(round(value))
+        changes[name] = value
+    return replace(new, **changes)
+
+
+def worth_animating(old: "Metrics", new: "Metrics") -> bool:
+    """True when at least one reading moved by more than its noise floor."""
+    for name, threshold in EASE_THRESHOLDS.items():
+        start, end = getattr(old, name), getattr(new, name)
+        if start is None or end is None:
+            continue
+        if abs(end - start) >= threshold:
+            return True
+    return False
+
+
+def ease_to(
+    writer: "LcdWriter",
+    old: "Metrics",
+    new: "Metrics",
+    style: str,
+    final: Image.Image,
+) -> bool:
+    """Animate the readings travelling to their new values.
+
+    ``final`` is the already-rendered destination frame, passed in so the last
+    step is not rendered a second time.
+    """
+    steps = max(1, int(round(EASE_SECONDS / FAST_LCD_FRAME_TIME)))
+    for step in range(1, steps):
+        if _stop:
+            return False
+        if not writer.push(render(ease_metrics(old, new, step / steps), style)):
+            return False
+    return writer.push(final)
+
+
+def crossfade(writer: "LcdWriter", old: Image.Image, new: Image.Image) -> bool:
+    """Dissolve ``old`` into ``new``.
+
+    Step count is derived from the measured frame time rather than fixed, so
+    the fade lasts about CROSSFADE_SECONDS whatever the device can manage. On
+    the slow path this collapses to a single step, which is the right failure:
+    a two-frame "fade" is just a cut, where a long one would look broken.
+    """
+    steps = max(1, int(round(CROSSFADE_SECONDS / FAST_LCD_FRAME_TIME)))
+    if old.mode != new.mode:
+        old = old.convert(new.mode)
+    for step in range(1, steps):
+        if _stop:
+            return False
+        if not writer.push(Image.blend(old, new, step / steps)):
+            return False
     return writer.push(new)
 
 
@@ -1837,6 +1971,11 @@ class LcdWriter:
 
     def __init__(self) -> None:
         self.consecutive_failures = 0
+        # The in-process writer, connected lazily. None means "not connected";
+        # a failure drops it back to None and the next push reconnects, falling
+        # back to the liquidctl CLI in the meantime so a HUD still appears.
+        self._fast: "FastLcd | None" = None
+        self._fast_failed = not FAST_LCD_ENABLED
         # Wall-clock time of the first failed push in the current streak, so a
         # recovery can log how long the LCD was actually dark for. The journal
         # only ever showed the moment an error was *printed*, not how long the
@@ -1845,6 +1984,16 @@ class LcdWriter:
         # succeeded again -- this fills that gap for diagnosing "goes black
         # for a while" reports that don't reach MAX_CONSECUTIVE_FAILURES.
         self.failure_since: float | None = None
+
+    @property
+    def is_fast(self) -> bool:
+        """Whether frames are currently going out at ~150ms rather than ~560ms.
+
+        Animations are gated on this. Easing a reading over half a second means
+        three frames on the fast path and the better part of two seconds on the
+        slow one, where it would read as lag rather than motion.
+        """
+        return self._fast is not None
 
     def initialize(self) -> bool:
         proc = _run_locked([LIQUIDCTL, "initialize", "all"], timeout=30.0)
@@ -1855,6 +2004,46 @@ class LcdWriter:
         return ok
 
     def push(self, image: Image.Image) -> bool:
+        """Send one frame, preferring the in-process writer.
+
+        The fast path skips the PNG round trip and the liquidctl subprocess
+        entirely, which is most of why a frame used to cost 0.56s. It is tried
+        first and silently stepped over if the device cannot be opened, so the
+        HUD still works -- just slowly -- wherever the fast path cannot run.
+        """
+        if not self._fast_failed:
+            if self._fast is None:
+                candidate = FastLcd()
+                if candidate.connect():
+                    self._fast = candidate
+                    print(f"[hud] fast LCD writer active ({FAST_LCD_FPS:.1f} fps ceiling)",
+                          file=sys.stderr)
+                else:
+                    # One failed connect is enough to stop trying every frame;
+                    # a restart re-tests it.
+                    self._fast_failed = True
+                    print("[hud] fast LCD writer unavailable, using liquidctl",
+                          file=sys.stderr)
+            if self._fast is not None:
+                if self._fast.push(image):
+                    self.consecutive_failures = 0
+                    if self.failure_since is not None:
+                        print(
+                            f"[hud] LCD recovered after "
+                            f"{time.monotonic() - self.failure_since:.1f}s dark",
+                            file=sys.stderr,
+                        )
+                        self.failure_since = None
+                    return True
+                # push() already closed the handle; fall through to the CLI
+                # path for this frame rather than dropping it.
+                self._fast = None
+                if _stop:
+                    return False
+
+        return self._push_via_cli(image)
+
+    def _push_via_cli(self, image: Image.Image) -> bool:
         FRAME_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Write to a temporary file and rename, so liquidctl can never observe
         # a half-written PNG.
@@ -1957,6 +2146,11 @@ def run_loop(interval: float, style: str = DEFAULT_STYLE) -> int:
     last_image = render_loading(0.35)
     writer.push(last_image)
 
+    # The readings behind the last frame shown, so the next one can be animated
+    # from them. None until the first real telemetry, so the first frame after
+    # the loading splash lands without an ease from nowhere.
+    last_metrics: "Metrics | None" = None
+
     psutil.cpu_percent(interval=None)  # prime the load counter
 
     # The face is whatever the config says, not a fixed CLI choice: the
@@ -1996,12 +2190,26 @@ def run_loop(interval: float, style: str = DEFAULT_STYLE) -> int:
             if changed and transition == "loading":
                 writer.push(render_loading(0.5, "LOADING"))
 
-            image = render(collect(), style)
-            if changed and transition == "wipe" and last_image is not None:
+            metrics = collect()
+            image = render(metrics, style)
+            if changed and last_image is not None and transition == "wipe":
                 wipe(writer, last_image, image)
+            elif changed and last_image is not None and transition == "crossfade":
+                crossfade(writer, last_image, image)
+            elif (
+                # Only when nothing else is already animating, only on the fast
+                # path, and only when a reading actually moved -- otherwise this
+                # is a plain single-frame update, as before.
+                not changed
+                and writer.is_fast
+                and last_metrics is not None
+                and worth_animating(last_metrics, metrics)
+            ):
+                ease_to(writer, last_metrics, metrics, style, image)
             else:
                 writer.push(image)
             last_image = image
+            last_metrics = metrics
             frame_error_streak = 0
         except Exception as exc:  # keep the service alive across transient faults...
             print(f"[hud] frame error: {exc!r}", file=sys.stderr)

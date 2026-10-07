@@ -65,6 +65,49 @@ Note that `set lcd screen static` re-reads the device's stored orientation and
 brightness first (`_write([0x30,0x01])`), then resizes/rotates the image itself,
 so the HUD does not need to pre-rotate its own frames.
 
+## LCD throughput
+
+Measured on the real cooler on 2026-10-06, with the HUD service stopped.
+
+A `set lcd screen static` push through the CLI takes **566 ms**. Held open
+in-process it is **476 ms**. Broken down per step:
+
+| step | ms |
+| --- | --- |
+| bulk transfer of the frame | ~155 |
+| `_prepare_static_file` | ~52 |
+| `_query_buckets` (16 HID round trips) | ~32 |
+| orientation + brightness read (`[0x30, 0x01]`) | ~19 |
+| bucket allocate/free churn | ~20 |
+| liquidctl subprocess start | ~90 |
+| PNG encode, write, re-decode | ~30 |
+
+`coldloop_lcd.py` keeps only the first line, reaching **6.7 fps sustained**
+(median 152 ms/frame, measured over 134 frames of a real animation).
+
+Three facts worth not relearning:
+
+1. **The device sustains ~10.3 MB/s.** A 640x640 frame is 1600 KB at 4 bytes
+   per pixel, so ~155 ms is the floor. Verified device-bound, not host-bound,
+   by varying the USB chunk size from 64 KB to 2 MB: throughput is flat.
+2. **`_prepare_static_file` appends four values per pixel in Python** --
+   1,638,400 appends per frame. The numpy equivalent is ~2.5 ms and was
+   verified byte-identical on a real frame. Do not "simplify" it back.
+3. **`_send_data` wraps every chunk in `list()`** before handing it to pyusb,
+   rebuilding the whole payload as a Python list. Passing `bytes` straight
+   through is ~1.2x on the transfer alone.
+
+Bucket handling matters beyond speed. The driver allocates a fresh bucket per
+push, cycles all 16 and wraps, which is the documented cause of
+`AssertionError('reached max bucket')` and the HUD's "randomly goes black"
+reports. Alternating two fixed buckets never wraps.
+
+Holding the device open claims the USB **bulk** interface. Verified that this
+does not disturb the HID commands everything else uses: `status`,
+`set pump speed`, `set fan speed` and `set lcd screen brightness` all still
+succeed while the HUD holds the device. Only image pushes use bulk, and only
+the HUD pushes images.
+
 ## Lighting: the pump ring and the RGB fan chain
 
 Verified on 2026-08-20 on the real device, by watching the LEDs.
